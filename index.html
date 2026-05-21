@@ -266,6 +266,29 @@
       font-variant-numeric: tabular-nums;
       text-align: center;
     }
+    /* 表示オン・オフ切替（スケルトン／角度）。
+       レッスンで素早く押せるよう、再生ボタン並みの大きさにする。 */
+    .toggle-btn {
+      flex: 1;
+      padding: 12px 8px;
+      border: none;
+      border-radius: 8px;
+      font-size: 15px;
+      font-weight: bold;
+      cursor: pointer;
+      -webkit-appearance: none;
+    }
+    .toggle-btn.on {
+      background: #2a7fff;
+      color: #fff;
+    }
+    .toggle-btn.off {
+      background: #2a2a2a;
+      color: #888;
+    }
+    .toggle-btn:active {
+      opacity: 0.85;
+    }
   </style>
 </head>
 <body>
@@ -313,6 +336,11 @@
             <button class="speed-btn" data-rate="0.25">0.25x</button>
           </div>
         </div>
+        <!-- 表示オン・オフ切替。スケルトンと角度を独立に切り替えられる -->
+        <div class="btn-row">
+          <button id="toggleSkeletonBtn" class="toggle-btn on" aria-pressed="true">スケルトン: ON</button>
+          <button id="toggleAnglesBtn" class="toggle-btn on" aria-pressed="true">角度: ON</button>
+        </div>
         <!-- コマ送り（一時停止中に1コマずつ進む／戻る） -->
         <div class="btn-row">
           <button id="stepBackBtn" class="action-btn" disabled>◀ 1コマ戻る</button>
@@ -357,9 +385,16 @@
     const seekBar = document.getElementById("seekBar");
     const currentTimeText = document.getElementById("currentTimeText");
     const totalTimeText = document.getElementById("totalTimeText");
+    const toggleSkeletonBtn = document.getElementById("toggleSkeletonBtn");
+    const toggleAnglesBtn = document.getElementById("toggleAnglesBtn");
     const video = document.getElementById("video");
     const videoCanvas = document.getElementById("videoCanvas");
     const videoCtx = videoCanvas.getContext("2d");
+
+    // 表示オン・オフのフラグ（動画分析専用）。初期状態は両方オン。
+    // オフでも姿勢推定自体は止めず、描画段階だけスキップする。
+    let showSkeleton = true;
+    let showAngles = true;
 
     let poseLandmarker = null;       // 静止画用 PoseLandmarker（IMAGEモード）
     let poseLandmarkerVideo = null;  // 動画用 PoseLandmarker（VIDEOモード）
@@ -944,14 +979,19 @@
           const lm = useSmoothing
             ? smoothLandmarks(result.landmarks[0], now)
             : applyVisibilityFilterOnly(result.landmarks[0]);
-          drawSkeleton(
-            videoCtx,
-            lm,
-            videoCanvas.width,
-            videoCanvas.height,
-            VIDEO_VISIBILITY_THRESHOLD
-          );
-          drawAngles(videoCtx, lm, videoCanvas.width, videoCanvas.height);
+          // 表示トグルに応じて描画をスキップ（推定自体は止めない）
+          if (showSkeleton) {
+            drawSkeleton(
+              videoCtx,
+              lm,
+              videoCanvas.width,
+              videoCanvas.height,
+              VIDEO_VISIBILITY_THRESHOLD
+            );
+          }
+          if (showAngles) {
+            drawAngles(videoCtx, lm, videoCanvas.width, videoCanvas.height);
+          }
         }
       } catch (err) {
         console.error(err);
@@ -1123,6 +1163,38 @@
         // セグメントボタンのアクティブ状態を更新
         speedButtons.forEach((b) => b.classList.toggle("active", b === btn));
       });
+    });
+
+    // トグルボタンの見た目（ON/OFF、文字、aria-pressed）を状態に合わせて更新
+    function updateToggleButton(btn, on, label) {
+      btn.classList.toggle("on", on);
+      btn.classList.toggle("off", !on);
+      btn.setAttribute("aria-pressed", on ? "true" : "false");
+      btn.textContent = `${label}: ${on ? "ON" : "OFF"}`;
+    }
+
+    // 表示トグルの変更を受けて、一時停止中なら即座に再描画する。
+    // 再生中は次のrAFループで自然に反映されるため何もしなくてよい。
+    function refreshOverlayIfPaused() {
+      if (!poseLandmarkerVideo) return;
+      if (!isFinite(video.duration) || video.duration <= 0) return;
+      if (video.paused) {
+        runDetectionAndDraw(false);
+      }
+    }
+
+    // スケルトン表示のオン・オフ
+    toggleSkeletonBtn.addEventListener("click", () => {
+      showSkeleton = !showSkeleton;
+      updateToggleButton(toggleSkeletonBtn, showSkeleton, "スケルトン");
+      refreshOverlayIfPaused();
+    });
+
+    // 角度・傾き表示のオン・オフ
+    toggleAnglesBtn.addEventListener("click", () => {
+      showAngles = !showAngles;
+      updateToggleButton(toggleAnglesBtn, showAngles, "角度");
+      refreshOverlayIfPaused();
     });
 
     // 再生開始時：ボタン表示を「一時停止」にして検出ループを開始。
