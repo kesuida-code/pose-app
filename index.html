@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <!-- iPhoneでの拡大/縮小を防ぎ、スマホ縦画面でレイアウトが崩れないようにする -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>姿勢分析アプリ</title>
+  <style>
+    /* 全体のリセットと基本配色 */
+    * {
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #111;
+      color: #eee;
+      font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Helvetica Neue", Arial, sans-serif;
+      min-height: 100vh;
+    }
+    /* メインコンテナ：スマホ縦画面でも崩れないように最大幅を制限 */
+    .container {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    h1 {
+      font-size: 18px;
+      margin: 0;
+      text-align: center;
+      color: #fff;
+    }
+    /* 操作パネル */
+    .controls {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    /* ファイル選択ボタン（標準のinputは隠してラベルをボタン風に） */
+    .file-label {
+      display: block;
+      width: 100%;
+      padding: 14px 16px;
+      background: #2a7fff;
+      color: #fff;
+      text-align: center;
+      font-size: 16px;
+      font-weight: bold;
+      border-radius: 8px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .file-label:active {
+      background: #1f6ad6;
+    }
+    .file-input {
+      display: none;
+    }
+    /* ステータス表示 */
+    .status {
+      font-size: 14px;
+      padding: 10px 12px;
+      background: #222;
+      border-radius: 6px;
+      min-height: 1.4em;
+      word-break: break-word;
+    }
+    .status.error {
+      background: #4a1a1a;
+      color: #ff8b8b;
+    }
+    /* キャンバスの表示エリア。画像のアスペクト比を保ち、横幅は親要素に合わせる */
+    .canvas-wrap {
+      width: 100%;
+      background: #000;
+      border-radius: 8px;
+      overflow: hidden;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 120px;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: auto;
+      max-width: 100%;
+    }
+    /* 補助テキスト */
+    .hint {
+      font-size: 12px;
+      color: #888;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>姿勢分析（写真1枚から検出）</h1>
+
+    <div class="controls">
+      <!-- ファイル選択用ラベル。inputはdisplay:noneで隠しているのでラベル全体がボタンになる -->
+      <label class="file-label" for="fileInput">画像を選択</label>
+      <input class="file-input" id="fileInput" type="file" accept="image/*" />
+      <div class="status" id="status">準備中：モデルを読み込んでいます…</div>
+    </div>
+
+    <div class="canvas-wrap">
+      <!-- 画像 + スケルトンを重ねて描画するキャンバス -->
+      <canvas id="canvas" width="1" height="1"></canvas>
+    </div>
+
+    <div class="hint">画像はサーバーに送信されず、すべて端末内で処理されます。</div>
+  </div>
+
+  <!-- MediaPipe Tasks Vision はESMでCDNから読み込み、IMAGEモードでPoseLandmarkerを使う -->
+  <script type="module">
+    // CDNからMediaPipe Tasks Visionを読み込む
+    import {
+      PoseLandmarker,
+      FilesetResolver
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+    // DOM要素の取得
+    const fileInput = document.getElementById("fileInput");
+    const statusEl = document.getElementById("status");
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+
+    let poseLandmarker = null; // PoseLandmarker のインスタンス
+    let lastImage = null;       // 最後に読み込んだ画像（再描画用）
+
+    // ステータス表示ヘルパー
+    function setStatus(message, isError = false) {
+      statusEl.textContent = message;
+      statusEl.classList.toggle("error", isError);
+    }
+
+    // PoseLandmarkerをIMAGEモードで初期化（1人のみ検出）
+    async function initPoseLandmarker() {
+      try {
+        // WASMファイルのパスを指定
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+        );
+        // モデルを読み込む（軽量・高速なlite版を使用。iPhoneでも動きやすい）
+        poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+            delegate: "GPU" // GPUが使えない場合はTasks Vision側で自動的にCPUへフォールバック
+          },
+          runningMode: "IMAGE", // 1枚の画像を処理するモード
+          numPoses: 1            // 検出する人数は1人
+        });
+        setStatus("準備完了：画像を選択してください。");
+      } catch (err) {
+        console.error(err);
+        setStatus("モデルの読み込みに失敗しました：" + err.message, true);
+      }
+    }
+
+    // MediaPipeのPoseLandmarkerが返す骨格の接続定義（左右の関節をつなぐペア）
+    // 33点の標準的なPose Landmarksに対応
+    const POSE_CONNECTIONS = [
+      // 顔
+      [0, 1], [1, 2], [2, 3], [3, 7],
+      [0, 4], [4, 5], [5, 6], [6, 8],
+      [9, 10],
+      // 胴体
+      [11, 12], [11, 23], [12, 24], [23, 24],
+      // 左腕
+      [11, 13], [13, 15], [15, 17], [15, 19], [15, 21], [17, 19],
+      // 右腕
+      [12, 14], [14, 16], [16, 18], [16, 20], [16, 22], [18, 20],
+      // 左脚
+      [23, 25], [25, 27], [27, 29], [27, 31], [29, 31],
+      // 右脚
+      [24, 26], [26, 28], [28, 30], [28, 32], [30, 32]
+    ];
+
+    // スケルトンをキャンバスに描画する
+    function drawSkeleton(landmarks, width, height) {
+      // 骨（線）を描画
+      ctx.lineWidth = Math.max(2, Math.round(width * 0.004));
+      ctx.strokeStyle = "#00e676"; // 緑系で骨を表現
+      for (const [a, b] of POSE_CONNECTIONS) {
+        const p1 = landmarks[a];
+        const p2 = landmarks[b];
+        if (!p1 || !p2) continue;
+        ctx.beginPath();
+        ctx.moveTo(p1.x * width, p1.y * height);
+        ctx.lineTo(p2.x * width, p2.y * height);
+        ctx.stroke();
+      }
+      // 関節点（円）を描画
+      const radius = Math.max(3, Math.round(width * 0.006));
+      ctx.fillStyle = "#ff5252"; // 赤系で関節点を表現
+      for (const p of landmarks) {
+        ctx.beginPath();
+        ctx.arc(p.x * width, p.y * height, radius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    // 画像とスケルトンをまとめて描画する
+    function renderImageWithPose(image, result) {
+      // キャンバスサイズを画像の実寸に合わせる
+      canvas.width = image.naturalWidth;
+      canvas.height = image.naturalHeight;
+      // 画像を描画
+      ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+      // 1人分のランドマークがあればスケルトンを重ねて描画する
+      if (result && result.landmarks && result.landmarks.length > 0) {
+        drawSkeleton(result.landmarks[0], canvas.width, canvas.height);
+        setStatus("検出成功：1人分の姿勢を表示しています。");
+      } else {
+        setStatus("人物の姿勢を検出できませんでした。別の画像をお試しください。", true);
+      }
+    }
+
+    // ファイル選択時の処理
+    fileInput.addEventListener("change", async (event) => {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+      if (!poseLandmarker) {
+        setStatus("モデルがまだ読み込まれていません。少し待ってからお試しください。", true);
+        return;
+      }
+      setStatus("画像を読み込み中…");
+
+      try {
+        // 画像をオブジェクトURL経由でHTMLImageElementとして読み込む
+        const url = URL.createObjectURL(file);
+        const image = new Image();
+        // iOS Safariでもデコード完了を待つためにdecode()を使う
+        image.src = url;
+        await image.decode();
+        lastImage = image;
+
+        setStatus("姿勢を解析中…");
+        // PoseLandmarkerに画像を渡して検出を実行（IMAGEモードはdetectメソッド）
+        const result = poseLandmarker.detect(image);
+        // 結果を描画
+        renderImageWithPose(image, result);
+
+        // 使い終わったオブジェクトURLは解放
+        URL.revokeObjectURL(url);
+      } catch (err) {
+        console.error(err);
+        setStatus("解析中にエラーが発生しました：" + err.message, true);
+      } finally {
+        // 同じファイルを再選択できるようにinputの値をリセット
+        fileInput.value = "";
+      }
+    });
+
+    // ページ読み込み時にモデルの初期化を開始
+    initPoseLandmarker();
+  </script>
+</body>
+</html>
