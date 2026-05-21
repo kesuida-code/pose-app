@@ -344,6 +344,52 @@
       font-weight: bold;
       font-variant-numeric: tabular-nums;
     }
+    /* 動画分析 ↔ お手本 の比較表示。動画を一時停止中かつお手本が登録されている時のみ表示 */
+    .comparison-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      background: #1a1a1a;
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .comparison-wrap[hidden] { display: none; }
+    .comparison-title {
+      font-size: 14px;
+      color: #fff;
+      font-weight: bold;
+    }
+    .comparison-list {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    /* 4カラム：項目 / お手本 / 生徒 / 差。スマホ縦でも収まるよう右寄せ等幅で数値を並べる */
+    .comparison-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1.3fr) repeat(3, minmax(0, 1fr));
+      align-items: baseline;
+      font-size: 13px;
+      gap: 6px;
+    }
+    .comparison-row.header {
+      font-size: 11px;
+      color: #888;
+      border-bottom: 1px solid #2a2a2a;
+      padding-bottom: 4px;
+    }
+    .comparison-row .name { color: #aaa; }
+    .comparison-row .val {
+      color: #fff;
+      font-weight: bold;
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+    }
+    .comparison-row.header .name,
+    .comparison-row.header .val {
+      color: #888;
+      font-weight: normal;
+    }
   </style>
 </head>
 <body>
@@ -437,6 +483,12 @@
         <div id="verticalHandle" class="guide-handle vertical-handle" hidden aria-label="垂直線の位置"></div>
         <div id="horizontalHandle" class="guide-handle horizontal-handle" hidden aria-label="水平線の位置"></div>
       </div>
+
+      <!-- お手本との比較。一時停止中＆お手本登録済み のときだけ表示 -->
+      <div id="comparisonWrap" class="comparison-wrap" hidden>
+        <div class="comparison-title">お手本との比較</div>
+        <div id="comparisonList" class="comparison-list"></div>
+      </div>
     </section>
 
     <div class="hint">画像・動画はサーバーに送信されず、すべて端末内で処理されます。</div>
@@ -462,6 +514,10 @@
     const referenceCanvas = document.getElementById("referenceCanvas");
     const referenceCtx = referenceCanvas.getContext("2d");
     const referenceAngleList = document.getElementById("referenceAngleList");
+
+    // DOM要素の取得（比較表示用）
+    const comparisonWrap = document.getElementById("comparisonWrap");
+    const comparisonList = document.getElementById("comparisonList");
 
     // お手本画像から計算した角度をメモリ保存するグローバル。
     // 後で動画と比較するために参照する。値は度数（number）、
@@ -1012,6 +1068,8 @@
         referenceAngleList.hidden = false;
         setReferenceStatus("人物の姿勢を検出できませんでした。別の画像をお試しください。", true);
       }
+      // 動画が既に一時停止中ならお手本との比較表示も更新する（後からお手本を登録したケース）
+      updateComparisonDisplay();
     }
 
     // お手本画像のファイル選択ハンドラ。
@@ -1046,6 +1104,73 @@
     });
 
     // === ここまで お手本画像 ===
+
+    // === 動画 ↔ お手本 の比較表示 ===
+
+    // referenceAngles に少なくとも1つ有効な値があるかを判定する
+    function hasReferenceData() {
+      return referenceAngles.leftKnee !== null
+          || referenceAngles.rightKnee !== null
+          || referenceAngles.leftElbow !== null
+          || referenceAngles.rightElbow !== null
+          || referenceAngles.shoulderTilt !== null
+          || referenceAngles.bodyTilt !== null;
+    }
+
+    // 比較表（項目／お手本／生徒／差）を DOM に書き出す
+    function renderComparisonList(studentAngles) {
+      const items = [
+        ["左膝",       referenceAngles.leftKnee,     studentAngles.leftKnee],
+        ["右膝",       referenceAngles.rightKnee,    studentAngles.rightKnee],
+        ["左肘",       referenceAngles.leftElbow,    studentAngles.leftElbow],
+        ["右肘",       referenceAngles.rightElbow,   studentAngles.rightElbow],
+        ["肩の傾き",   referenceAngles.shoulderTilt, studentAngles.shoulderTilt],
+        ["上体の傾き", referenceAngles.bodyTilt,     studentAngles.bodyTilt]
+      ];
+      const header = `<div class="comparison-row header"><span class="name">項目</span><span class="val">お手本</span><span class="val">生徒</span><span class="val">差</span></div>`;
+      const rows = items.map(([label, ref, stu]) => {
+        const refStr = formatAngleValue(ref);
+        const stuStr = formatAngleValue(stu);
+        // どちらか一方でも値がない（null/undefined）なら差も「—」
+        let diffStr = "—";
+        if (ref !== null && ref !== undefined && stu !== null && stu !== undefined) {
+          // 差は 生徒 − お手本（正なら +, 負なら - を付けて表示）
+          const d = Math.round(stu - ref);
+          diffStr = d > 0 ? `+${d}°` : `${d}°`;
+        }
+        return `<div class="comparison-row"><span class="name">${label}</span><span class="val">${refStr}</span><span class="val">${stuStr}</span><span class="val">${diffStr}</span></div>`;
+      });
+      comparisonList.innerHTML = header + rows.join("");
+    }
+
+    // 比較表示の表示／非表示と中身を、現在の状態に合わせて更新する。
+    // 表示する条件：(1) 動画が一時停止中 (2) お手本が登録済み の両方を満たすとき。
+    // 生徒側の角度は lastDrawData（直近の検出結果キャッシュ）から計算する。
+    function updateComparisonDisplay() {
+      // 再生中は比較表示を出さない
+      if (!video.paused) {
+        comparisonWrap.hidden = true;
+        return;
+      }
+      // お手本未登録なら表示しない（既存の角度表示だけ）
+      if (!hasReferenceData()) {
+        comparisonWrap.hidden = true;
+        return;
+      }
+      // 現在のコマの角度を計算（検出結果が無ければ全て null）
+      let studentAngles = {
+        leftKnee: null, rightKnee: null,
+        leftElbow: null, rightElbow: null,
+        shoulderTilt: null, bodyTilt: null
+      };
+      if (lastDrawData && lastDrawData.lm) {
+        studentAngles = computeAnglesFromLandmarks(lastDrawData.lm);
+      }
+      renderComparisonList(studentAngles);
+      comparisonWrap.hidden = false;
+    }
+
+    // === ここまで 比較表示 ===
 
     // ファイル選択時の処理
     fileInput.addEventListener("change", async (event) => {
@@ -1277,6 +1402,8 @@
       }
       // 基準線はスケルトン・角度の上に乗せる
       drawGuideLines();
+      // 比較表示も状態に合わせて更新（再生中は内部で早期returnするので軽い）
+      updateComparisonDisplay();
     }
 
     // 現在の動画フレームに対して姿勢検出を行い、結果をキャッシュして描画する。
@@ -1583,6 +1710,8 @@
       if (rafId === null) {
         rafId = requestAnimationFrame(videoFrame);
       }
+      // 再生中は比較表示を隠す
+      updateComparisonDisplay();
     });
 
     // 一時停止／終了時：ボタン表示を戻し、コマ送りを有効化（ループは videoFrame 内で自然停止）
@@ -1591,12 +1720,15 @@
       setVideoStatus("一時停止中。コマ送りで1コマずつ確認できます。");
       stepBackBtn.disabled = false;
       stepForwardBtn.disabled = false;
+      // 一時停止時は直近キャッシュを使って比較表示を更新（お手本登録済みなら表示）
+      updateComparisonDisplay();
     });
     video.addEventListener("ended", () => {
       playPauseBtn.textContent = "再生";
       setVideoStatus("再生が終了しました。");
       stepBackBtn.disabled = false;
       stepForwardBtn.disabled = false;
+      updateComparisonDisplay();
     });
 
     // エラー時の表示
