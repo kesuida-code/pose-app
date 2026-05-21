@@ -206,6 +206,66 @@
       opacity: 0.5;
       cursor: not-allowed;
     }
+    /* シークバー（再生位置スライダー）と時間表示 */
+    .seek-row {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    /* タッチで掴みやすいよう、つまみは大きめにする */
+    .seek-bar {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 100%;
+      height: 30px;          /* タッチ領域を確保するための高さ */
+      background: transparent;
+      padding: 0;
+      margin: 0;
+      cursor: pointer;
+    }
+    .seek-bar:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    /* WebKit系（iOS Safari, Chrome）のトラックとつまみ */
+    .seek-bar::-webkit-slider-runnable-track {
+      height: 6px;
+      background: #2a2a2a;
+      border-radius: 3px;
+    }
+    .seek-bar::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      appearance: none;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: #2a7fff;
+      border: none;
+      margin-top: -9px; /* つまみをトラックの中央に揃える */
+      cursor: pointer;
+    }
+    /* Firefox用のトラックとつまみ */
+    .seek-bar::-moz-range-track {
+      height: 6px;
+      background: #2a2a2a;
+      border-radius: 3px;
+      border: none;
+    }
+    .seek-bar::-moz-range-thumb {
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: #2a7fff;
+      border: none;
+      cursor: pointer;
+    }
+    /* 現在時間／総時間の表示。数字幅を揃えてカウンタがガタつかないようにする */
+    .time-display {
+      font-size: 13px;
+      color: #ccc;
+      font-variant-numeric: tabular-nums;
+      text-align: center;
+    }
   </style>
 </head>
 <body>
@@ -237,6 +297,13 @@
         <input class="file-input" id="videoFileInput" type="file" accept="video/*" />
         <!-- 再生・一時停止ボタン。動画が読み込まれるまで無効 -->
         <button id="playPauseBtn" class="action-btn" disabled>再生</button>
+        <!-- シークバー（再生位置）。動画読み込みまで無効 -->
+        <div class="seek-row">
+          <input id="seekBar" class="seek-bar" type="range" min="0" max="0" step="0.01" value="0" disabled aria-label="再生位置" />
+          <div class="time-display">
+            <span id="currentTimeText">0:00</span> / <span id="totalTimeText">0:00</span>
+          </div>
+        </div>
         <!-- 再生速度（1x / 0.5x / 0.25x）。スロー再生用 -->
         <div class="speed-row">
           <span class="speed-label">速度</span>
@@ -287,6 +354,9 @@
     const stepBackBtn = document.getElementById("stepBackBtn");
     const stepForwardBtn = document.getElementById("stepForwardBtn");
     const speedButtons = Array.from(document.querySelectorAll(".speed-btn"));
+    const seekBar = document.getElementById("seekBar");
+    const currentTimeText = document.getElementById("currentTimeText");
+    const totalTimeText = document.getElementById("totalTimeText");
     const video = document.getElementById("video");
     const videoCanvas = document.getElementById("videoCanvas");
     const videoCtx = videoCanvas.getContext("2d");
@@ -916,6 +986,25 @@
       video.currentTime = newTime;
     }
 
+    // 秒数を "0:03" / "1:23:45" のような文字列に変換する
+    function formatTime(sec) {
+      if (!isFinite(sec) || sec < 0) sec = 0;
+      const total = Math.floor(sec);
+      const h = Math.floor(total / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      const s = total % 60;
+      const ss = s.toString().padStart(2, "0");
+      if (h > 0) {
+        const mm = m.toString().padStart(2, "0");
+        return `${h}:${mm}:${ss}`;
+      }
+      return `${m}:${ss}`;
+    }
+
+    // シークバーをユーザーが操作中かどうかのフラグ。
+    // ドラッグ中は再生位置でスライダー値を上書きしないようにする。
+    let isSeekDragging = false;
+
     // 動画ファイル選択時：オブジェクトURLを差し替えて video に読み込む
     videoFileInput.addEventListener("change", (event) => {
       const file = event.target.files && event.target.files[0];
@@ -934,6 +1023,13 @@
       lastVideoTime = -1;
       lastFrameMediaTime = null;
       resetVideoFilters();
+      // シークバーと時間表示も初期化（メタ情報読込み後に loadedmetadata で正値が入る）
+      seekBar.value = "0";
+      seekBar.max = "0";
+      seekBar.disabled = true;
+      isSeekDragging = false;
+      currentTimeText.textContent = formatTime(0);
+      totalTimeText.textContent = formatTime(0);
       setVideoStatus("動画を読み込み中…");
       // 同じファイル再選択を可能にする
       videoFileInput.value = "";
@@ -962,7 +1058,14 @@
       // 読み込み直後は一時停止状態。コマ送りボタンも有効化する
       stepBackBtn.disabled = false;
       stepForwardBtn.disabled = false;
-      setVideoStatus("読み込み完了：再生・コマ送り・速度変更が使えます。");
+      // シークバーの範囲を動画の長さに合わせ、時間表示も更新
+      const duration = isFinite(video.duration) ? video.duration : 0;
+      seekBar.max = String(duration);
+      seekBar.value = "0";
+      seekBar.disabled = false;
+      currentTimeText.textContent = formatTime(0);
+      totalTimeText.textContent = formatTime(duration);
+      setVideoStatus("読み込み完了：再生・コマ送り・シーク・速度変更が使えます。");
     });
 
     // 再生・一時停止ボタン
@@ -981,6 +1084,34 @@
     // コマ送り（前へ／次へ）。一時停止中のみ有効
     stepBackBtn.addEventListener("click", () => stepFrame(-1));
     stepForwardBtn.addEventListener("click", () => stepFrame(+1));
+
+    // シークバー：ユーザーがつまみを動かすと video.currentTime を更新する。
+    // input は値が変わるたび（ドラッグ中も）連続で発火する。
+    // 実際の検出と描画は seeked イベントで一本化されているため、
+    // ここでは時刻と表示の更新だけ行う（コマ送り・任意シークと同じ扱い）。
+    seekBar.addEventListener("input", () => {
+      const t = parseFloat(seekBar.value);
+      if (!isFinite(t)) return;
+      // 再生中でも一時停止中でも、その位置にジャンプする
+      video.currentTime = t;
+      currentTimeText.textContent = formatTime(t);
+    });
+
+    // ドラッグ開始／終了の判定。
+    // ドラッグ中は timeupdate でスライダー値が再生位置に上書きされないようにする。
+    seekBar.addEventListener("pointerdown", () => { isSeekDragging = true; });
+    // スライダー外で指を離されてもフラグを戻せるよう window でも拾う
+    const endSeekDrag = () => { isSeekDragging = false; };
+    window.addEventListener("pointerup", endSeekDrag);
+    window.addEventListener("pointercancel", endSeekDrag);
+
+    // 再生位置の更新を受けてスライダーと現在時間表示を追従させる。
+    // ドラッグ中はユーザー操作を優先するため上書きしない。
+    video.addEventListener("timeupdate", () => {
+      if (isSeekDragging) return;
+      seekBar.value = String(video.currentTime);
+      currentTimeText.textContent = formatTime(video.currentTime);
+    });
 
     // 再生速度の切替。video.playbackRate を変えるだけで video が遅く再生される
     speedButtons.forEach((btn) => {
