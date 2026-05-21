@@ -289,6 +289,61 @@
     .toggle-btn:active {
       opacity: 0.85;
     }
+    .toggle-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    /* 基準線（垂直・水平）をドラッグするためのハンドル。
+       タッチでつかみやすいよう36pxの円形に。pointer-events を有効化し、
+       touch-action: none でドラッグ中にページがスクロールしないようにする。 */
+    .guide-handle {
+      position: absolute;
+      width: 36px;
+      height: 36px;
+      background: #ffeb3b;
+      border: 2px solid #000;
+      border-radius: 50%;
+      pointer-events: auto;
+      cursor: grab;
+      touch-action: none;
+      transform: translate(-50%, -50%);
+      box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+      z-index: 2;
+    }
+    .guide-handle[hidden] {
+      display: none;
+    }
+    .guide-handle:active {
+      cursor: grabbing;
+    }
+    /* 垂直線のハンドル：xはJSで動的指定、yは画面中央 */
+    .vertical-handle { top: 50%; }
+    /* 水平線のハンドル：yはJSで動的指定、xは画面中央 */
+    .horizontal-handle { left: 50%; }
+    /* お手本画像セクション：計算した角度の一覧表示 */
+    .angle-list {
+      background: #1a1a1a;
+      border-radius: 8px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .angle-list[hidden] { display: none; }
+    .angle-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      font-size: 14px;
+    }
+    .angle-name {
+      color: #aaa;
+    }
+    .angle-value {
+      color: #fff;
+      font-weight: bold;
+      font-variant-numeric: tabular-nums;
+    }
   </style>
 </head>
 <body>
@@ -308,6 +363,24 @@
       <div class="canvas-wrap">
         <!-- 画像 + スケルトンを重ねて描画するキャンバス -->
         <canvas id="canvas" width="1" height="1"></canvas>
+      </div>
+    </section>
+
+    <!-- お手本画像セクション：後で動画と比較するためのリファレンス姿勢を1枚保存する -->
+    <section class="section">
+      <h2>お手本画像</h2>
+      <div class="controls">
+        <!-- お手本画像のアップロードボタン -->
+        <label class="file-label" for="referenceFileInput">お手本画像を選択</label>
+        <input class="file-input" id="referenceFileInput" type="file" accept="image/*" />
+        <div class="status" id="referenceStatus">お手本画像を選ぶと、姿勢推定と角度計算を行います。</div>
+        <!-- 角度一覧（初期は非表示。お手本画像が読み込まれてから表示） -->
+        <div class="angle-list" id="referenceAngleList" hidden></div>
+      </div>
+
+      <div class="canvas-wrap">
+        <!-- お手本画像＋スケルトン＋角度を重ねるキャンバス -->
+        <canvas id="referenceCanvas" width="1" height="1"></canvas>
       </div>
     </section>
 
@@ -341,6 +414,11 @@
           <button id="toggleSkeletonBtn" class="toggle-btn on" aria-pressed="true">スケルトン: ON</button>
           <button id="toggleAnglesBtn" class="toggle-btn on" aria-pressed="true">角度: ON</button>
         </div>
+        <!-- 基準線（垂直・水平）の表示切替。線はドラッグで位置を移動できる -->
+        <div class="btn-row">
+          <button id="toggleVerticalLineBtn" class="toggle-btn off" aria-pressed="false" disabled>垂直線: OFF</button>
+          <button id="toggleHorizontalLineBtn" class="toggle-btn off" aria-pressed="false" disabled>水平線: OFF</button>
+        </div>
         <!-- コマ送り（一時停止中に1コマずつ進む／戻る） -->
         <div class="btn-row">
           <button id="stepBackBtn" class="action-btn" disabled>◀ 1コマ戻る</button>
@@ -355,6 +433,9 @@
         <video id="video" playsinline preload="metadata"></video>
         <!-- スケルトン描画用オーバーレイ -->
         <canvas id="videoCanvas" width="1" height="1"></canvas>
+        <!-- 基準線のドラッグ用ハンドル（初期は非表示） -->
+        <div id="verticalHandle" class="guide-handle vertical-handle" hidden aria-label="垂直線の位置"></div>
+        <div id="horizontalHandle" class="guide-handle horizontal-handle" hidden aria-label="水平線の位置"></div>
       </div>
     </section>
 
@@ -375,6 +456,25 @@
     const canvas = document.getElementById("canvas");
     const ctx = canvas.getContext("2d");
 
+    // DOM要素の取得（お手本画像用）
+    const referenceFileInput = document.getElementById("referenceFileInput");
+    const referenceStatusEl = document.getElementById("referenceStatus");
+    const referenceCanvas = document.getElementById("referenceCanvas");
+    const referenceCtx = referenceCanvas.getContext("2d");
+    const referenceAngleList = document.getElementById("referenceAngleList");
+
+    // お手本画像から計算した角度をメモリ保存するグローバル。
+    // 後で動画と比較するために参照する。値は度数（number）、
+    // 信頼度が低くて計算できなかった項目は null。
+    let referenceAngles = {
+      leftKnee: null,
+      rightKnee: null,
+      leftElbow: null,
+      rightElbow: null,
+      shoulderTilt: null,
+      bodyTilt: null
+    };
+
     // DOM要素の取得（動画用）
     const videoFileInput = document.getElementById("videoFileInput");
     const videoStatusEl = document.getElementById("videoStatus");
@@ -387,14 +487,30 @@
     const totalTimeText = document.getElementById("totalTimeText");
     const toggleSkeletonBtn = document.getElementById("toggleSkeletonBtn");
     const toggleAnglesBtn = document.getElementById("toggleAnglesBtn");
+    const toggleVerticalLineBtn = document.getElementById("toggleVerticalLineBtn");
+    const toggleHorizontalLineBtn = document.getElementById("toggleHorizontalLineBtn");
+    const videoWrap = document.getElementById("videoWrap");
+    const verticalHandle = document.getElementById("verticalHandle");
+    const horizontalHandle = document.getElementById("horizontalHandle");
     const video = document.getElementById("video");
     const videoCanvas = document.getElementById("videoCanvas");
     const videoCtx = videoCanvas.getContext("2d");
 
-    // 表示オン・オフのフラグ（動画分析専用）。初期状態は両方オン。
+    // 表示オン・オフのフラグ（動画分析専用）。初期状態：スケルトン/角度はON、基準線はOFF。
     // オフでも姿勢推定自体は止めず、描画段階だけスキップする。
     let showSkeleton = true;
     let showAngles = true;
+    let showVerticalLine = false;
+    let showHorizontalLine = false;
+
+    // 基準線の位置（動画領域に対する 0〜1 の正規化座標）。
+    // 動画ファイル切替後も維持。ドラッグで更新される。
+    let verticalLinePos = 0.5;   // x方向の比率（0=左端, 1=右端）
+    let horizontalLinePos = 0.5; // y方向の比率（0=上端, 1=下端）
+
+    // 直近の姿勢検出結果のキャッシュ。
+    // 基準線のドラッグやトグル切替で「検出を再実行せずに描画だけ更新」するために使う。
+    let lastDrawData = null;
 
     let poseLandmarker = null;       // 静止画用 PoseLandmarker（IMAGEモード）
     let poseLandmarkerVideo = null;  // 動画用 PoseLandmarker（VIDEOモード）
@@ -786,6 +902,151 @@
       }
     }
 
+    // === お手本画像（リファレンス姿勢） ===
+
+    // ステータス表示ヘルパー（お手本画像用）
+    function setReferenceStatus(message, isError = false) {
+      referenceStatusEl.textContent = message;
+      referenceStatusEl.classList.toggle("error", isError);
+    }
+
+    // 数値（度数）を文字列に整形。null/undefined は「—」を返す。
+    // visibility が低くて計算できなかった項目に使う。
+    function formatAngleValue(v) {
+      if (v === null || v === undefined) return "—";
+      return `${Math.round(v)}°`;
+    }
+
+    // ランドマーク配列から、既存の静止画分析と同じ6項目の角度を計算して返す。
+    // 計算に必要な関節の isVisible（既存と同じ0.3しきい値）を満たさない項目は null。
+    function computeAnglesFromLandmarks(landmarks) {
+      const lShoulder = landmarks[LM.LEFT_SHOULDER];
+      const rShoulder = landmarks[LM.RIGHT_SHOULDER];
+      const lElbow    = landmarks[LM.LEFT_ELBOW];
+      const rElbow    = landmarks[LM.RIGHT_ELBOW];
+      const lWrist    = landmarks[LM.LEFT_WRIST];
+      const rWrist    = landmarks[LM.RIGHT_WRIST];
+      const lHip      = landmarks[LM.LEFT_HIP];
+      const rHip      = landmarks[LM.RIGHT_HIP];
+      const lKnee     = landmarks[LM.LEFT_KNEE];
+      const rKnee     = landmarks[LM.RIGHT_KNEE];
+      const lAnkle    = landmarks[LM.LEFT_ANKLE];
+      const rAnkle    = landmarks[LM.RIGHT_ANKLE];
+
+      const out = {
+        leftKnee: null, rightKnee: null,
+        leftElbow: null, rightElbow: null,
+        shoulderTilt: null, bodyTilt: null
+      };
+      // 左右の膝（股関節-膝-足首）
+      if (isVisible(lHip) && isVisible(lKnee) && isVisible(lAnkle)) {
+        out.leftKnee = calcAngle3(lHip, lKnee, lAnkle);
+      }
+      if (isVisible(rHip) && isVisible(rKnee) && isVisible(rAnkle)) {
+        out.rightKnee = calcAngle3(rHip, rKnee, rAnkle);
+      }
+      // 左右の肘（肩-肘-手首）
+      if (isVisible(lShoulder) && isVisible(lElbow) && isVisible(lWrist)) {
+        out.leftElbow = calcAngle3(lShoulder, lElbow, lWrist);
+      }
+      if (isVisible(rShoulder) && isVisible(rElbow) && isVisible(rWrist)) {
+        out.rightElbow = calcAngle3(rShoulder, rElbow, rWrist);
+      }
+      // 肩の傾き（両肩を結ぶ線の水平からのズレ）
+      if (isVisible(lShoulder) && isVisible(rShoulder)) {
+        out.shoulderTilt = calcTiltFromHorizontal(lShoulder, rShoulder);
+      }
+      // 上体の傾き（股関節中点→肩中点が垂直からどれだけ傾いているか）
+      if (isVisible(lShoulder) && isVisible(rShoulder) && isVisible(lHip) && isVisible(rHip)) {
+        const shoulderMid = {
+          x: (lShoulder.x + rShoulder.x) / 2,
+          y: (lShoulder.y + rShoulder.y) / 2
+        };
+        const hipMid = {
+          x: (lHip.x + rHip.x) / 2,
+          y: (lHip.y + rHip.y) / 2
+        };
+        out.bodyTilt = calcTiltFromVertical(hipMid, shoulderMid);
+      }
+      return out;
+    }
+
+    // referenceAngles の内容を一覧表示として DOM に書き出す
+    function renderReferenceAngleList() {
+      const items = [
+        ["左膝",       referenceAngles.leftKnee],
+        ["右膝",       referenceAngles.rightKnee],
+        ["左肘",       referenceAngles.leftElbow],
+        ["右肘",       referenceAngles.rightElbow],
+        ["肩の傾き",   referenceAngles.shoulderTilt],
+        ["上体の傾き", referenceAngles.bodyTilt]
+      ];
+      referenceAngleList.innerHTML = items.map(([label, value]) =>
+        `<div class="angle-row"><span class="angle-name">${label}</span><span class="angle-value">${formatAngleValue(value)}</span></div>`
+      ).join("");
+    }
+
+    // お手本画像とスケルトン・角度をキャンバスに描画する。
+    // 既存の drawSkeleton / drawAngles をそのまま再利用する。
+    function renderReferenceImageWithPose(image, result) {
+      referenceCanvas.width = image.naturalWidth;
+      referenceCanvas.height = image.naturalHeight;
+      referenceCtx.drawImage(image, 0, 0, referenceCanvas.width, referenceCanvas.height);
+      if (result && result.landmarks && result.landmarks.length > 0) {
+        const landmarks = result.landmarks[0];
+        drawSkeleton(referenceCtx, landmarks, referenceCanvas.width, referenceCanvas.height);
+        drawAngles(referenceCtx, landmarks, referenceCanvas.width, referenceCanvas.height);
+        // 角度を計算してメモリ保存 → 一覧表示も更新
+        referenceAngles = computeAnglesFromLandmarks(landmarks);
+        renderReferenceAngleList();
+        referenceAngleList.hidden = false;
+        setReferenceStatus("お手本の姿勢と角度を保存しました。");
+      } else {
+        // 検出失敗時は値をクリア
+        referenceAngles = {
+          leftKnee: null, rightKnee: null,
+          leftElbow: null, rightElbow: null,
+          shoulderTilt: null, bodyTilt: null
+        };
+        renderReferenceAngleList();
+        referenceAngleList.hidden = false;
+        setReferenceStatus("人物の姿勢を検出できませんでした。別の画像をお試しください。", true);
+      }
+    }
+
+    // お手本画像のファイル選択ハンドラ。
+    // 既存の poseLandmarker（IMAGEモード）を共用する。
+    referenceFileInput.addEventListener("change", async (event) => {
+      const file = event.target.files && event.target.files[0];
+      if (!file) return;
+      if (!poseLandmarker) {
+        setReferenceStatus("モデルがまだ読み込まれていません。少し待ってからお試しください。", true);
+        return;
+      }
+      setReferenceStatus("お手本画像を読み込み中…");
+      let url = null;
+      try {
+        url = URL.createObjectURL(file);
+        const image = new Image();
+        image.src = url;
+        // iOS Safariでもデコード完了を待つ
+        await image.decode();
+
+        setReferenceStatus("お手本の姿勢を解析中…");
+        const result = poseLandmarker.detect(image);
+        renderReferenceImageWithPose(image, result);
+      } catch (err) {
+        console.error(err);
+        setReferenceStatus("解析中にエラーが発生しました：" + err.message, true);
+      } finally {
+        if (url) URL.revokeObjectURL(url);
+        // 同じファイルを再選択できるように
+        referenceFileInput.value = "";
+      }
+    });
+
+    // === ここまで お手本画像 ===
+
     // ファイル選択時の処理
     fileInput.addEventListener("change", async (event) => {
       const file = event.target.files && event.target.files[0];
@@ -963,7 +1224,62 @@
       });
     }
 
-    // 現在の動画フレームに対して姿勢検出を行い、スケルトンと角度を描画する。
+    // 基準線（垂直・水平）を Canvas に描画する。スケルトンと区別するため
+    // 黄色の点線で描く。線の位置は normalized 値 × Canvas寸 で換算する。
+    function drawGuideLines() {
+      if (!showVerticalLine && !showHorizontalLine) return;
+      if (videoCanvas.width <= 1 || videoCanvas.height <= 1) return;
+      const w = videoCanvas.width;
+      const h = videoCanvas.height;
+      videoCtx.save();
+      videoCtx.strokeStyle = "#ffeb3b"; // 黄色（緑のスケルトン・赤の関節と区別）
+      videoCtx.lineWidth = Math.max(2, Math.round(w * 0.003));
+      // 動画サイズに合わせてダッシュ長さも調整
+      const dash = Math.max(8, Math.round(w * 0.012));
+      const gap = Math.max(6, Math.round(w * 0.008));
+      videoCtx.setLineDash([dash, gap]);
+
+      if (showVerticalLine) {
+        const x = verticalLinePos * w;
+        videoCtx.beginPath();
+        videoCtx.moveTo(x, 0);
+        videoCtx.lineTo(x, h);
+        videoCtx.stroke();
+      }
+      if (showHorizontalLine) {
+        const y = horizontalLinePos * h;
+        videoCtx.beginPath();
+        videoCtx.moveTo(0, y);
+        videoCtx.lineTo(w, y);
+        videoCtx.stroke();
+      }
+      videoCtx.restore();
+    }
+
+    // 現在のキャッシュ（lastDrawData）と表示フラグに基づいてオーバーレイを再描画する。
+    // 検出は行わないので、ドラッグやトグル切替など軽量な更新に使う。
+    function renderOverlay() {
+      if (videoCanvas.width <= 1 || videoCanvas.height <= 1) return;
+      videoCtx.clearRect(0, 0, videoCanvas.width, videoCanvas.height);
+      if (lastDrawData && lastDrawData.lm) {
+        if (showSkeleton) {
+          drawSkeleton(
+            videoCtx,
+            lastDrawData.lm,
+            videoCanvas.width,
+            videoCanvas.height,
+            VIDEO_VISIBILITY_THRESHOLD
+          );
+        }
+        if (showAngles) {
+          drawAngles(videoCtx, lastDrawData.lm, videoCanvas.width, videoCanvas.height);
+        }
+      }
+      // 基準線はスケルトン・角度の上に乗せる
+      drawGuideLines();
+    }
+
+    // 現在の動画フレームに対して姿勢検出を行い、結果をキャッシュして描画する。
     // useSmoothing=true なら時間方向のスムージングを適用（再生中）。
     // false なら生の検出結果をそのまま使う（一時停止中・コマ送り中）。
     function runDetectionAndDraw(useSmoothing) {
@@ -973,26 +1289,15 @@
         // performance.now() を渡す
         const now = performance.now();
         const result = poseLandmarkerVideo.detectForVideo(video, now);
-        // オーバーレイをクリアして再描画
-        videoCtx.clearRect(0, 0, videoCanvas.width, videoCanvas.height);
+        let lm = null;
         if (result && result.landmarks && result.landmarks.length > 0) {
-          const lm = useSmoothing
+          lm = useSmoothing
             ? smoothLandmarks(result.landmarks[0], now)
             : applyVisibilityFilterOnly(result.landmarks[0]);
-          // 表示トグルに応じて描画をスキップ（推定自体は止めない）
-          if (showSkeleton) {
-            drawSkeleton(
-              videoCtx,
-              lm,
-              videoCanvas.width,
-              videoCanvas.height,
-              VIDEO_VISIBILITY_THRESHOLD
-            );
-          }
-          if (showAngles) {
-            drawAngles(videoCtx, lm, videoCanvas.width, videoCanvas.height);
-          }
         }
+        // 描画キャッシュを更新 → renderOverlay で実描画（基準線も含む）
+        lastDrawData = { lm };
+        renderOverlay();
       } catch (err) {
         console.error(err);
       }
@@ -1062,6 +1367,7 @@
       videoCtx.clearRect(0, 0, videoCanvas.width, videoCanvas.height);
       lastVideoTime = -1;
       lastFrameMediaTime = null;
+      lastDrawData = null; // 検出結果のキャッシュも破棄
       resetVideoFilters();
       // シークバーと時間表示も初期化（メタ情報読込み後に loadedmetadata で正値が入る）
       seekBar.value = "0";
@@ -1098,6 +1404,9 @@
       // 読み込み直後は一時停止状態。コマ送りボタンも有効化する
       stepBackBtn.disabled = false;
       stepForwardBtn.disabled = false;
+      // 基準線トグルも有効化（動画領域がないと意味がないためここで初解放）
+      toggleVerticalLineBtn.disabled = false;
+      toggleHorizontalLineBtn.disabled = false;
       // シークバーの範囲を動画の長さに合わせ、時間表示も更新
       const duration = isFinite(video.duration) ? video.duration : 0;
       seekBar.max = String(duration);
@@ -1174,11 +1483,14 @@
     }
 
     // 表示トグルの変更を受けて、一時停止中なら即座に再描画する。
+    // 検出結果のキャッシュがあれば renderOverlay（軽量）、なければ
+    // 一度だけ runDetectionAndDraw（検出含む）で初期描画する。
     // 再生中は次のrAFループで自然に反映されるため何もしなくてよい。
     function refreshOverlayIfPaused() {
-      if (!poseLandmarkerVideo) return;
-      if (!isFinite(video.duration) || video.duration <= 0) return;
-      if (video.paused) {
+      if (!video.paused) return;
+      if (lastDrawData !== null) {
+        renderOverlay();
+      } else if (poseLandmarkerVideo && isFinite(video.duration) && video.duration > 0) {
         runDetectionAndDraw(false);
       }
     }
@@ -1196,6 +1508,70 @@
       updateToggleButton(toggleAnglesBtn, showAngles, "角度");
       refreshOverlayIfPaused();
     });
+
+    // 基準線（垂直・水平）のハンドルの表示状態と位置を反映する
+    function updateGuideHandles() {
+      verticalHandle.hidden = !showVerticalLine;
+      horizontalHandle.hidden = !showHorizontalLine;
+      verticalHandle.style.left = `${verticalLinePos * 100}%`;
+      horizontalHandle.style.top = `${horizontalLinePos * 100}%`;
+    }
+
+    // 垂直線のオン・オフ
+    toggleVerticalLineBtn.addEventListener("click", () => {
+      showVerticalLine = !showVerticalLine;
+      updateToggleButton(toggleVerticalLineBtn, showVerticalLine, "垂直線");
+      updateGuideHandles();
+      refreshOverlayIfPaused();
+    });
+
+    // 水平線のオン・オフ
+    toggleHorizontalLineBtn.addEventListener("click", () => {
+      showHorizontalLine = !showHorizontalLine;
+      updateToggleButton(toggleHorizontalLineBtn, showHorizontalLine, "水平線");
+      updateGuideHandles();
+      refreshOverlayIfPaused();
+    });
+
+    // ハンドルのドラッグ処理を共通化。Pointer Events でマウス・タッチ両対応。
+    // setPointerCapture で指がハンドルから外れても move を受け続けられる。
+    function attachGuideDragHandler(handle, isVertical) {
+      let activePointerId = null;
+      handle.addEventListener("pointerdown", (e) => {
+        activePointerId = e.pointerId;
+        try { handle.setPointerCapture(e.pointerId); } catch (_) {}
+        e.preventDefault();
+      });
+      handle.addEventListener("pointermove", (e) => {
+        if (activePointerId === null || e.pointerId !== activePointerId) return;
+        // 動画ラッパー基準で相対座標を求め、0〜1 にクランプする
+        const rect = videoWrap.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return;
+        if (isVertical) {
+          verticalLinePos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+        } else {
+          horizontalLinePos = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+        }
+        updateGuideHandles();
+        // 一時停止中は基準線だけ動かす：キャッシュからの軽量再描画でOK。
+        // 再生中は次のrAFで自然に反映されるため何もしなくてよい。
+        if (video.paused) {
+          renderOverlay();
+        }
+      });
+      const endDrag = (e) => {
+        if (activePointerId === null || e.pointerId !== activePointerId) return;
+        try { handle.releasePointerCapture(activePointerId); } catch (_) {}
+        activePointerId = null;
+      };
+      handle.addEventListener("pointerup", endDrag);
+      handle.addEventListener("pointercancel", endDrag);
+    }
+    attachGuideDragHandler(verticalHandle, true);
+    attachGuideDragHandler(horizontalHandle, false);
+
+    // 初期ハンドル位置を反映（非表示状態だが、表示時にすぐ正しい位置になる）
+    updateGuideHandles();
 
     // 再生開始時：ボタン表示を「一時停止」にして検出ループを開始。
     // 再生中はコマ送りボタンを無効化（誤操作で意図せずシークしないため）。
