@@ -245,6 +245,20 @@
       return tilt;
     }
 
+    // 下点 pLower から上点 pUpper へのベクトルが、垂直（真上）から
+    // どれだけ傾いているかを度数で返す（0〜180度の範囲）。
+    // 上体の傾き判定に使う：pLower=股関節中点, pUpper=肩中点。
+    function calcTiltFromVertical(pLower, pUpper) {
+      const dx = pUpper.x - pLower.x;
+      const dy = pUpper.y - pLower.y; // 画像座標系ではy軸が下向きなので、上方向はdy<0
+      const mag = Math.hypot(dx, dy);
+      if (mag === 0) return null;
+      // 「真上」方向ベクトル (0, -1) と (dx, dy) のなす角
+      // cosθ = ((0)(dx) + (-1)(dy)) / mag = -dy / mag
+      const cos = Math.max(-1, Math.min(1, -dy / mag));
+      return Math.acos(cos) * 180 / Math.PI;
+    }
+
     // ランドマーク（正規化座標）が信頼できるかを判定するヘルパー
     // visibility が極端に低いものは計算から外して誤表示を防ぐ
     function isVisible(p) {
@@ -254,9 +268,62 @@
       return p.visibility >= 0.3;
     }
 
-    // キャンバス上の指定座標に「ラベル付きの数値」を読みやすく描画する
-    // 背景の半透明矩形＋白文字＋黒い縁取りで、どんな画像の上でも視認性を確保する
-    function drawAngleLabel(text, cx, cy, width) {
+    // 2つの矩形が重なっているかを判定するヘルパー
+    function rectsOverlap(a, b) {
+      return !(a.x + a.w <= b.x || b.x + b.w <= a.x ||
+               a.y + a.h <= b.y || b.y + b.h <= a.y);
+    }
+
+    // 矩形上で点(px,py)に最も近い座標を返す（引き出し線の終点に使う）
+    function closestPointOnRect(rect, px, py) {
+      const cx = Math.max(rect.x, Math.min(px, rect.x + rect.w));
+      const cy = Math.max(rect.y, Math.min(py, rect.y + rect.h));
+      return { x: cx, y: cy };
+    }
+
+    // 関節位置(anchorX, anchorY)に対して、既に置かれたラベル矩形と
+    // 重ならない配置を探す。8方向 × 4距離レベルを試し、それでも置けなければ
+    // 最後のフォールバック位置を返す。
+    function findLabelPosition(anchorX, anchorY, w, h, baseOffset, placedRects) {
+      // 探索する方向（右下, 右, 右上, 上, 左上, 左, 左下, 下）
+      const dirs = [
+        [1, 1], [1, 0], [1, -1], [0, -1],
+        [-1, -1], [-1, 0], [-1, 1], [0, 1]
+      ];
+      const distances = [baseOffset, baseOffset * 2, baseOffset * 3.5, baseOffset * 5];
+
+      for (const d of distances) {
+        for (const [dx, dy] of dirs) {
+          let x, y;
+          if (dx > 0)      x = anchorX + d;
+          else if (dx < 0) x = anchorX - d - w;
+          else             x = anchorX - w / 2;
+          if (dy > 0)      y = anchorY + d;
+          else if (dy < 0) y = anchorY - d - h;
+          else             y = anchorY - h / 2;
+
+          // キャンバスからはみ出すものは除外
+          if (x < 0 || y < 0 || x + w > canvas.width || y + h > canvas.height) continue;
+
+          const rect = { x, y, w, h };
+          let collides = false;
+          for (const r of placedRects) {
+            if (rectsOverlap(rect, r)) { collides = true; break; }
+          }
+          if (!collides) return rect;
+        }
+      }
+      // フォールバック：右下にオフセットし、キャンバス内に収まるようにクランプ
+      const fx = Math.max(0, Math.min(canvas.width  - w, anchorX + baseOffset));
+      const fy = Math.max(0, Math.min(canvas.height - h, anchorY + baseOffset));
+      return { x: fx, y: fy, w, h };
+    }
+
+    // キャンバス上に「ラベル付きの数値」を読みやすく描画する。
+    // 既に置かれた他のラベルと重ならないよう配置を自動調整し、
+    // 関節点から離れた位置に置く場合は引き出し線でつなぐ。
+    // placedRects は呼び出し側で配列を渡し、描画した矩形が追記される。
+    function drawAngleLabel(text, anchorX, anchorY, width, placedRects) {
       // スマホでも読めるよう、画像幅に対する比率でフォントサイズを決める（下限あり）
       const fontSize = Math.max(16, Math.round(width * 0.028));
       ctx.font = `bold ${fontSize}px -apple-system, "Hiragino Sans", sans-serif`;
@@ -266,37 +333,46 @@
       const paddingX = Math.round(fontSize * 0.35);
       const paddingY = Math.round(fontSize * 0.2);
       const metrics = ctx.measureText(text);
-      const textW = metrics.width;
-      const textH = fontSize;
+      const boxW = metrics.width + paddingX * 2;
+      const boxH = fontSize + paddingY * 2;
 
-      // ラベルの左上座標。関節点の少し右下にずらす
-      const offset = Math.round(fontSize * 0.4);
-      let x = cx + offset;
-      let y = cy + offset;
-      // キャンバス右端からはみ出す場合は左側に反転表示
-      if (x + textW + paddingX * 2 > canvas.width) {
-        x = cx - textW - paddingX * 2 - offset;
-      }
-      // 下端からはみ出す場合は上に反転表示
-      if (y + textH + paddingY * 2 > canvas.height) {
-        y = cy - textH - paddingY * 2 - offset;
+      // 重なりを避けて配置を決定
+      const baseOffset = Math.max(8, Math.round(fontSize * 0.6));
+      const rect = findLabelPosition(anchorX, anchorY, boxW, boxH, baseOffset, placedRects);
+
+      // 関節点が矩形の外にある場合は引き出し線を描く（矩形に重なっていれば不要）
+      const anchorInside =
+        anchorX >= rect.x && anchorX <= rect.x + rect.w &&
+        anchorY >= rect.y && anchorY <= rect.y + rect.h;
+      if (!anchorInside) {
+        const edge = closestPointOnRect(rect, anchorX, anchorY);
+        // 細めの白線で目立ちすぎないように
+        ctx.lineWidth = Math.max(1, Math.round(fontSize * 0.08));
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
+        ctx.beginPath();
+        ctx.moveTo(anchorX, anchorY);
+        ctx.lineTo(edge.x, edge.y);
+        ctx.stroke();
       }
 
-      // 背景（半透明の黒い角丸風矩形）
+      // 背景（半透明の黒い矩形）
       ctx.fillStyle = "rgba(0, 0, 0, 0.65)";
-      ctx.fillRect(x, y, textW + paddingX * 2, textH + paddingY * 2);
+      ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
 
       // 文字（白＋黒縁取り）
       ctx.lineWidth = Math.max(2, Math.round(fontSize * 0.12));
       ctx.strokeStyle = "rgba(0, 0, 0, 0.9)";
       ctx.fillStyle = "#ffffff";
-      const tx = x + paddingX;
-      const ty = y + paddingY + textH / 2;
+      const tx = rect.x + paddingX;
+      const ty = rect.y + paddingY + fontSize / 2;
       ctx.strokeText(text, tx, ty);
       ctx.fillText(text, tx, ty);
+
+      // 以降のラベルが避けられるよう、描画した矩形を記録
+      placedRects.push(rect);
     }
 
-    // 関節角度（左右の膝・肘）と体幹の傾きを計算し、画像上に重ねて表示する
+    // 関節角度（左右の膝・肘）と肩／上体の傾きを計算し、画像上に重ねて表示する
     function drawAngles(landmarks, width, height) {
       // 必要なランドマークを取り出す
       const lShoulder = landmarks[LM.LEFT_SHOULDER];
@@ -312,42 +388,63 @@
       const lAnkle    = landmarks[LM.LEFT_ANKLE];
       const rAnkle    = landmarks[LM.RIGHT_ANKLE];
 
+      // 配置済みラベルの矩形リスト（重なり回避のため drawAngleLabel に共有）
+      const placedRects = [];
+
       // 左膝の角度（股関節-膝-足首）
       if (isVisible(lHip) && isVisible(lKnee) && isVisible(lAnkle)) {
         const a = calcAngle3(lHip, lKnee, lAnkle);
         if (a !== null) {
-          drawAngleLabel(`左膝 ${Math.round(a)}°`, lKnee.x * width, lKnee.y * height, width);
+          drawAngleLabel(`左膝 ${Math.round(a)}°`, lKnee.x * width, lKnee.y * height, width, placedRects);
         }
       }
       // 右膝の角度（股関節-膝-足首）
       if (isVisible(rHip) && isVisible(rKnee) && isVisible(rAnkle)) {
         const a = calcAngle3(rHip, rKnee, rAnkle);
         if (a !== null) {
-          drawAngleLabel(`右膝 ${Math.round(a)}°`, rKnee.x * width, rKnee.y * height, width);
+          drawAngleLabel(`右膝 ${Math.round(a)}°`, rKnee.x * width, rKnee.y * height, width, placedRects);
         }
       }
       // 左肘の角度（肩-肘-手首）
       if (isVisible(lShoulder) && isVisible(lElbow) && isVisible(lWrist)) {
         const a = calcAngle3(lShoulder, lElbow, lWrist);
         if (a !== null) {
-          drawAngleLabel(`左肘 ${Math.round(a)}°`, lElbow.x * width, lElbow.y * height, width);
+          drawAngleLabel(`左肘 ${Math.round(a)}°`, lElbow.x * width, lElbow.y * height, width, placedRects);
         }
       }
       // 右肘の角度（肩-肘-手首）
       if (isVisible(rShoulder) && isVisible(rElbow) && isVisible(rWrist)) {
         const a = calcAngle3(rShoulder, rElbow, rWrist);
         if (a !== null) {
-          drawAngleLabel(`右肘 ${Math.round(a)}°`, rElbow.x * width, rElbow.y * height, width);
+          drawAngleLabel(`右肘 ${Math.round(a)}°`, rElbow.x * width, rElbow.y * height, width, placedRects);
         }
       }
-      // 体幹の傾き（左右の肩を結ぶ線が水平から何度傾いているか）
+      // 肩の傾き（左右の肩を結ぶ線が水平から何度傾いているか）
       // ラベルは両肩の中点付近に表示する
       if (isVisible(lShoulder) && isVisible(rShoulder)) {
         const tilt = calcTiltFromHorizontal(lShoulder, rShoulder);
         if (tilt !== null) {
           const mx = ((lShoulder.x + rShoulder.x) / 2) * width;
           const my = ((lShoulder.y + rShoulder.y) / 2) * height;
-          drawAngleLabel(`体幹傾き ${Math.round(tilt)}°`, mx, my, width);
+          drawAngleLabel(`肩の傾き ${Math.round(tilt)}°`, mx, my, width, placedRects);
+        }
+      }
+      // 上体の傾き（股関節中点→肩中点のベクトルが垂直から何度傾いているか）
+      // ラベルは胴体の中央あたり（股関節中点と肩中点のさらに中点）に表示する
+      if (isVisible(lShoulder) && isVisible(rShoulder) && isVisible(lHip) && isVisible(rHip)) {
+        const shoulderMid = {
+          x: (lShoulder.x + rShoulder.x) / 2,
+          y: (lShoulder.y + rShoulder.y) / 2
+        };
+        const hipMid = {
+          x: (lHip.x + rHip.x) / 2,
+          y: (lHip.y + rHip.y) / 2
+        };
+        const tilt = calcTiltFromVertical(hipMid, shoulderMid);
+        if (tilt !== null) {
+          const mx = ((shoulderMid.x + hipMid.x) / 2) * width;
+          const my = ((shoulderMid.y + hipMid.y) / 2) * height;
+          drawAngleLabel(`上体の傾き ${Math.round(tilt)}°`, mx, my, width, placedRects);
         }
       }
     }
