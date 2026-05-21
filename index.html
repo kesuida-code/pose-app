@@ -207,6 +207,151 @@
       }
     }
 
+    // ランドマークのインデックス（MediaPipe Pose の33点定義に準拠）
+    // 注意：MediaPipeの"left"/"right"は被写体本人から見た左右
+    const LM = {
+      LEFT_SHOULDER: 11, RIGHT_SHOULDER: 12,
+      LEFT_ELBOW: 13,    RIGHT_ELBOW: 14,
+      LEFT_WRIST: 15,    RIGHT_WRIST: 16,
+      LEFT_HIP: 23,      RIGHT_HIP: 24,
+      LEFT_KNEE: 25,     RIGHT_KNEE: 26,
+      LEFT_ANKLE: 27,    RIGHT_ANKLE: 28
+    };
+
+    // 3点 p1-p2-p3 がなす角度（p2を頂点とした角度、度数で返す）を計算する
+    // ベクトル v1 = p1-p2, v2 = p3-p2 の内積から余弦を求める
+    function calcAngle3(p1, p2, p3) {
+      const v1x = p1.x - p2.x, v1y = p1.y - p2.y;
+      const v2x = p3.x - p2.x, v2y = p3.y - p2.y;
+      const dot = v1x * v2x + v1y * v2y;
+      const mag1 = Math.hypot(v1x, v1y);
+      const mag2 = Math.hypot(v2x, v2y);
+      if (mag1 === 0 || mag2 === 0) return null;
+      // 浮動小数の誤差で acos の入力が ±1 を超えないようにクランプする
+      const cos = Math.max(-1, Math.min(1, dot / (mag1 * mag2)));
+      return Math.acos(cos) * 180 / Math.PI;
+    }
+
+    // 2点を結ぶ直線が水平からどれだけ傾いているか（度数）を返す
+    // 戻り値は 0〜90 の絶対値（左右どちらに傾いていても同じ大きさで表示）
+    function calcTiltFromHorizontal(pLeft, pRight) {
+      const dx = pRight.x - pLeft.x;
+      const dy = pRight.y - pLeft.y;
+      if (dx === 0 && dy === 0) return null;
+      const deg = Math.atan2(dy, dx) * 180 / Math.PI;
+      // ±180度の範囲で出るので、水平からのずれ（絶対値）に変換
+      let tilt = Math.abs(deg);
+      if (tilt > 90) tilt = 180 - tilt;
+      return tilt;
+    }
+
+    // ランドマーク（正規化座標）が信頼できるかを判定するヘルパー
+    // visibility が極端に低いものは計算から外して誤表示を防ぐ
+    function isVisible(p) {
+      if (!p) return false;
+      // visibilityが付与されていない場合もあるのでその時は通す
+      if (typeof p.visibility !== "number") return true;
+      return p.visibility >= 0.3;
+    }
+
+    // キャンバス上の指定座標に「ラベル付きの数値」を読みやすく描画する
+    // 背景の半透明矩形＋白文字＋黒い縁取りで、どんな画像の上でも視認性を確保する
+    function drawAngleLabel(text, cx, cy, width) {
+      // スマホでも読めるよう、画像幅に対する比率でフォントサイズを決める（下限あり）
+      const fontSize = Math.max(16, Math.round(width * 0.028));
+      ctx.font = `bold ${fontSize}px -apple-system, "Hiragino Sans", sans-serif`;
+      ctx.textBaseline = "middle";
+      ctx.textAlign = "left";
+
+      const paddingX = Math.round(fontSize * 0.35);
+      const paddingY = Math.round(fontSize * 0.2);
+      const metrics = ctx.measureText(text);
+      const textW = metrics.width;
+      const textH = fontSize;
+
+      // ラベルの左上座標。関節点の少し右下にずらす
+      const offset = Math.round(fontSize * 0.4);
+      let x = cx + offset;
+      let y = cy + offset;
+      // キャンバス右端からはみ出す場合は左側に反転表示
+      if (x + textW + paddingX * 2 > canvas.width) {
+        x = cx - textW - paddingX * 2 - offset;
+      }
+      // 下端からはみ出す場合は上に反転表示
+      if (y + textH + paddingY * 2 > canvas.height) {
+        y = cy - textH - paddingY * 2 - offset;
+      }
+
+      // 背景（半透明の黒い角丸風矩形）
+      ctx.fillStyle = "rgba(0, 0, 0, 0.65)";
+      ctx.fillRect(x, y, textW + paddingX * 2, textH + paddingY * 2);
+
+      // 文字（白＋黒縁取り）
+      ctx.lineWidth = Math.max(2, Math.round(fontSize * 0.12));
+      ctx.strokeStyle = "rgba(0, 0, 0, 0.9)";
+      ctx.fillStyle = "#ffffff";
+      const tx = x + paddingX;
+      const ty = y + paddingY + textH / 2;
+      ctx.strokeText(text, tx, ty);
+      ctx.fillText(text, tx, ty);
+    }
+
+    // 関節角度（左右の膝・肘）と体幹の傾きを計算し、画像上に重ねて表示する
+    function drawAngles(landmarks, width, height) {
+      // 必要なランドマークを取り出す
+      const lShoulder = landmarks[LM.LEFT_SHOULDER];
+      const rShoulder = landmarks[LM.RIGHT_SHOULDER];
+      const lElbow    = landmarks[LM.LEFT_ELBOW];
+      const rElbow    = landmarks[LM.RIGHT_ELBOW];
+      const lWrist    = landmarks[LM.LEFT_WRIST];
+      const rWrist    = landmarks[LM.RIGHT_WRIST];
+      const lHip      = landmarks[LM.LEFT_HIP];
+      const rHip      = landmarks[LM.RIGHT_HIP];
+      const lKnee     = landmarks[LM.LEFT_KNEE];
+      const rKnee     = landmarks[LM.RIGHT_KNEE];
+      const lAnkle    = landmarks[LM.LEFT_ANKLE];
+      const rAnkle    = landmarks[LM.RIGHT_ANKLE];
+
+      // 左膝の角度（股関節-膝-足首）
+      if (isVisible(lHip) && isVisible(lKnee) && isVisible(lAnkle)) {
+        const a = calcAngle3(lHip, lKnee, lAnkle);
+        if (a !== null) {
+          drawAngleLabel(`左膝 ${Math.round(a)}°`, lKnee.x * width, lKnee.y * height, width);
+        }
+      }
+      // 右膝の角度（股関節-膝-足首）
+      if (isVisible(rHip) && isVisible(rKnee) && isVisible(rAnkle)) {
+        const a = calcAngle3(rHip, rKnee, rAnkle);
+        if (a !== null) {
+          drawAngleLabel(`右膝 ${Math.round(a)}°`, rKnee.x * width, rKnee.y * height, width);
+        }
+      }
+      // 左肘の角度（肩-肘-手首）
+      if (isVisible(lShoulder) && isVisible(lElbow) && isVisible(lWrist)) {
+        const a = calcAngle3(lShoulder, lElbow, lWrist);
+        if (a !== null) {
+          drawAngleLabel(`左肘 ${Math.round(a)}°`, lElbow.x * width, lElbow.y * height, width);
+        }
+      }
+      // 右肘の角度（肩-肘-手首）
+      if (isVisible(rShoulder) && isVisible(rElbow) && isVisible(rWrist)) {
+        const a = calcAngle3(rShoulder, rElbow, rWrist);
+        if (a !== null) {
+          drawAngleLabel(`右肘 ${Math.round(a)}°`, rElbow.x * width, rElbow.y * height, width);
+        }
+      }
+      // 体幹の傾き（左右の肩を結ぶ線が水平から何度傾いているか）
+      // ラベルは両肩の中点付近に表示する
+      if (isVisible(lShoulder) && isVisible(rShoulder)) {
+        const tilt = calcTiltFromHorizontal(lShoulder, rShoulder);
+        if (tilt !== null) {
+          const mx = ((lShoulder.x + rShoulder.x) / 2) * width;
+          const my = ((lShoulder.y + rShoulder.y) / 2) * height;
+          drawAngleLabel(`体幹傾き ${Math.round(tilt)}°`, mx, my, width);
+        }
+      }
+    }
+
     // 画像とスケルトンをまとめて描画する
     function renderImageWithPose(image, result) {
       // キャンバスサイズを画像の実寸に合わせる
@@ -216,8 +361,11 @@
       ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
       // 1人分のランドマークがあればスケルトンを重ねて描画する
       if (result && result.landmarks && result.landmarks.length > 0) {
-        drawSkeleton(result.landmarks[0], canvas.width, canvas.height);
-        setStatus("検出成功：1人分の姿勢を表示しています。");
+        const landmarks = result.landmarks[0];
+        drawSkeleton(landmarks, canvas.width, canvas.height);
+        // スケルトンの上に関節角度・体幹傾きの数値を重ねる
+        drawAngles(landmarks, canvas.width, canvas.height);
+        setStatus("検出成功：1人分の姿勢と関節角度を表示しています。");
       } else {
         setStatus("人物の姿勢を検出できませんでした。別の画像をお試しください。", true);
       }
