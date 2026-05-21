@@ -159,6 +159,53 @@
     .action-btn:not(:disabled):active {
       background: #333;
     }
+    /* ボタンを横並びに配置する行（コマ送りボタンなど） */
+    .btn-row {
+      display: flex;
+      gap: 8px;
+    }
+    .btn-row .action-btn {
+      flex: 1;
+    }
+    /* 再生速度のセグメント風セレクター */
+    .speed-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .speed-row .speed-label {
+      font-size: 14px;
+      color: #ccc;
+      flex-shrink: 0;
+    }
+    .speed-buttons {
+      display: flex;
+      flex: 1;
+      background: #2a2a2a;
+      border-radius: 8px;
+      padding: 3px;
+      gap: 3px;
+    }
+    .speed-btn {
+      flex: 1;
+      padding: 9px 0;
+      background: transparent;
+      color: #ccc;
+      border: none;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: bold;
+      cursor: pointer;
+      -webkit-appearance: none;
+    }
+    .speed-btn.active {
+      background: #2a7fff;
+      color: #fff;
+    }
+    .speed-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
   </style>
 </head>
 <body>
@@ -190,6 +237,20 @@
         <input class="file-input" id="videoFileInput" type="file" accept="video/*" />
         <!-- 再生・一時停止ボタン。動画が読み込まれるまで無効 -->
         <button id="playPauseBtn" class="action-btn" disabled>再生</button>
+        <!-- 再生速度（1x / 0.5x / 0.25x）。スロー再生用 -->
+        <div class="speed-row">
+          <span class="speed-label">速度</span>
+          <div class="speed-buttons" role="group" aria-label="再生速度">
+            <button class="speed-btn active" data-rate="1">1x</button>
+            <button class="speed-btn" data-rate="0.5">0.5x</button>
+            <button class="speed-btn" data-rate="0.25">0.25x</button>
+          </div>
+        </div>
+        <!-- コマ送り（一時停止中に1コマずつ進む／戻る） -->
+        <div class="btn-row">
+          <button id="stepBackBtn" class="action-btn" disabled>◀ 1コマ戻る</button>
+          <button id="stepForwardBtn" class="action-btn" disabled>1コマ進む ▶</button>
+        </div>
         <div class="status" id="videoStatus">準備中：動画用モデルを読み込んでいます…</div>
       </div>
 
@@ -223,6 +284,9 @@
     const videoFileInput = document.getElementById("videoFileInput");
     const videoStatusEl = document.getElementById("videoStatus");
     const playPauseBtn = document.getElementById("playPauseBtn");
+    const stepBackBtn = document.getElementById("stepBackBtn");
+    const stepForwardBtn = document.getElementById("stepForwardBtn");
+    const speedButtons = Array.from(document.querySelectorAll(".speed-btn"));
     const video = document.getElementById("video");
     const videoCanvas = document.getElementById("videoCanvas");
     const videoCtx = videoCanvas.getContext("2d");
@@ -234,6 +298,21 @@
     // モデルのCDNパス（画像用・動画用で同じモデルを共有）
     const MODEL_ASSET_PATH =
       "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+
+    // 動画スケルトン描画で使う visibility のしきい値（0〜1）。
+    // これ未満のランドマークは点を描かず、両端のいずれかがしきい値未満の線も描かない。
+    // 画面外などで信頼度が落ちた関節のブレを抑えるための値。後で調整可。
+    const VIDEO_VISIBILITY_THRESHOLD = 0.5;
+
+    // 動画ランドマークの時間方向スムージング（One Euro Filter）のパラメータ。後で調整可。
+    //  - ONE_EURO_MIN_CUTOFF: 静止時の最低カットオフ周波数(Hz)。
+    //      小さいほど滑らか（ブレ低減）、大きいほど追従。
+    //  - ONE_EURO_BETA: 速度に応じてカットオフを引き上げる係数。
+    //      大きいほど速い動きへの追従を優先（ラグが減る）、小さいほど滑らか。
+    //  - ONE_EURO_D_CUTOFF: 速度成分の平滑化用カットオフ。通常 1.0 固定でよい。
+    const ONE_EURO_MIN_CUTOFF = 1.0;
+    const ONE_EURO_BETA = 0.5;
+    const ONE_EURO_D_CUTOFF = 1.0;
 
     // ステータス表示ヘルパー（静止画用）
     function setStatus(message, isError = false) {
@@ -303,23 +382,36 @@
 
     // スケルトンを指定されたCanvas 2Dコンテキストに描画する。
     // 静止画用と動画オーバーレイ用の両方から呼べるよう、targetCtx を引数で受け取る。
-    function drawSkeleton(targetCtx, landmarks, width, height) {
-      // 骨（線）を描画
+    // visibilityThreshold を指定すると、信頼度がしきい値未満のランドマークは
+    // 描画から除外する（画面外で関節がブレるのを防ぐため、動画側で使う）。
+    // 既定値は 0 ＝フィルタなし（静止画側の従来挙動を保つ）。
+    // visibility 値が未定義のランドマークは「信頼できる」扱いで通す。
+    function drawSkeleton(targetCtx, landmarks, width, height, visibilityThreshold = 0) {
+      // しきい値判定（visibility が無い場合は通す）
+      const passes = (p) => {
+        if (!p) return false;
+        if (typeof p.visibility !== "number") return true;
+        return p.visibility >= visibilityThreshold;
+      };
+
+      // 骨（線）を描画：両端のランドマークがしきい値以上のときのみ
       targetCtx.lineWidth = Math.max(2, Math.round(width * 0.004));
       targetCtx.strokeStyle = "#00e676"; // 緑系で骨を表現
       for (const [a, b] of POSE_CONNECTIONS) {
         const p1 = landmarks[a];
         const p2 = landmarks[b];
         if (!p1 || !p2) continue;
+        if (!passes(p1) || !passes(p2)) continue;
         targetCtx.beginPath();
         targetCtx.moveTo(p1.x * width, p1.y * height);
         targetCtx.lineTo(p2.x * width, p2.y * height);
         targetCtx.stroke();
       }
-      // 関節点（円）を描画
+      // 関節点（円）を描画：しきい値以上のものだけ
       const radius = Math.max(3, Math.round(width * 0.006));
       targetCtx.fillStyle = "#ff5252"; // 赤系で関節点を表現
       for (const p of landmarks) {
+        if (!passes(p)) continue;
         targetCtx.beginPath();
         targetCtx.arc(p.x * width, p.y * height, radius, 0, Math.PI * 2);
         targetCtx.fill();
@@ -403,7 +495,9 @@
     // 関節位置(anchorX, anchorY)に対して、既に置かれたラベル矩形と
     // 重ならない配置を探す。8方向 × 4距離レベルを試し、それでも置けなければ
     // 最後のフォールバック位置を返す。
-    function findLabelPosition(anchorX, anchorY, w, h, baseOffset, placedRects) {
+    // 対象のCanvasサイズは targetCtx.canvas から取得する。
+    function findLabelPosition(targetCtx, anchorX, anchorY, w, h, baseOffset, placedRects) {
+      const targetCanvas = targetCtx.canvas;
       // 探索する方向（右下, 右, 右上, 上, 左上, 左, 左下, 下）
       const dirs = [
         [1, 1], [1, 0], [1, -1], [0, -1],
@@ -422,7 +516,7 @@
           else             y = anchorY - h / 2;
 
           // キャンバスからはみ出すものは除外
-          if (x < 0 || y < 0 || x + w > canvas.width || y + h > canvas.height) continue;
+          if (x < 0 || y < 0 || x + w > targetCanvas.width || y + h > targetCanvas.height) continue;
 
           const rect = { x, y, w, h };
           let collides = false;
@@ -433,31 +527,31 @@
         }
       }
       // フォールバック：右下にオフセットし、キャンバス内に収まるようにクランプ
-      const fx = Math.max(0, Math.min(canvas.width  - w, anchorX + baseOffset));
-      const fy = Math.max(0, Math.min(canvas.height - h, anchorY + baseOffset));
+      const fx = Math.max(0, Math.min(targetCanvas.width  - w, anchorX + baseOffset));
+      const fy = Math.max(0, Math.min(targetCanvas.height - h, anchorY + baseOffset));
       return { x: fx, y: fy, w, h };
     }
 
-    // キャンバス上に「ラベル付きの数値」を読みやすく描画する。
+    // 指定したCanvas 2Dコンテキストに「ラベル付きの数値」を読みやすく描画する。
     // 既に置かれた他のラベルと重ならないよう配置を自動調整し、
     // 関節点から離れた位置に置く場合は引き出し線でつなぐ。
     // placedRects は呼び出し側で配列を渡し、描画した矩形が追記される。
-    function drawAngleLabel(text, anchorX, anchorY, width, placedRects) {
+    function drawAngleLabel(targetCtx, text, anchorX, anchorY, width, placedRects) {
       // スマホでも読めるよう、画像幅に対する比率でフォントサイズを決める（下限あり）
       const fontSize = Math.max(16, Math.round(width * 0.028));
-      ctx.font = `bold ${fontSize}px -apple-system, "Hiragino Sans", sans-serif`;
-      ctx.textBaseline = "middle";
-      ctx.textAlign = "left";
+      targetCtx.font = `bold ${fontSize}px -apple-system, "Hiragino Sans", sans-serif`;
+      targetCtx.textBaseline = "middle";
+      targetCtx.textAlign = "left";
 
       const paddingX = Math.round(fontSize * 0.35);
       const paddingY = Math.round(fontSize * 0.2);
-      const metrics = ctx.measureText(text);
+      const metrics = targetCtx.measureText(text);
       const boxW = metrics.width + paddingX * 2;
       const boxH = fontSize + paddingY * 2;
 
       // 重なりを避けて配置を決定
       const baseOffset = Math.max(8, Math.round(fontSize * 0.6));
-      const rect = findLabelPosition(anchorX, anchorY, boxW, boxH, baseOffset, placedRects);
+      const rect = findLabelPosition(targetCtx, anchorX, anchorY, boxW, boxH, baseOffset, placedRects);
 
       // 関節点が矩形の外にある場合は引き出し線を描く（矩形に重なっていれば不要）
       const anchorInside =
@@ -466,33 +560,33 @@
       if (!anchorInside) {
         const edge = closestPointOnRect(rect, anchorX, anchorY);
         // 細めの白線で目立ちすぎないように
-        ctx.lineWidth = Math.max(1, Math.round(fontSize * 0.08));
-        ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
-        ctx.beginPath();
-        ctx.moveTo(anchorX, anchorY);
-        ctx.lineTo(edge.x, edge.y);
-        ctx.stroke();
+        targetCtx.lineWidth = Math.max(1, Math.round(fontSize * 0.08));
+        targetCtx.strokeStyle = "rgba(255, 255, 255, 0.85)";
+        targetCtx.beginPath();
+        targetCtx.moveTo(anchorX, anchorY);
+        targetCtx.lineTo(edge.x, edge.y);
+        targetCtx.stroke();
       }
 
       // 背景（半透明の黒い矩形）
-      ctx.fillStyle = "rgba(0, 0, 0, 0.65)";
-      ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+      targetCtx.fillStyle = "rgba(0, 0, 0, 0.65)";
+      targetCtx.fillRect(rect.x, rect.y, rect.w, rect.h);
 
       // 文字（白＋黒縁取り）
-      ctx.lineWidth = Math.max(2, Math.round(fontSize * 0.12));
-      ctx.strokeStyle = "rgba(0, 0, 0, 0.9)";
-      ctx.fillStyle = "#ffffff";
+      targetCtx.lineWidth = Math.max(2, Math.round(fontSize * 0.12));
+      targetCtx.strokeStyle = "rgba(0, 0, 0, 0.9)";
+      targetCtx.fillStyle = "#ffffff";
       const tx = rect.x + paddingX;
       const ty = rect.y + paddingY + fontSize / 2;
-      ctx.strokeText(text, tx, ty);
-      ctx.fillText(text, tx, ty);
+      targetCtx.strokeText(text, tx, ty);
+      targetCtx.fillText(text, tx, ty);
 
       // 以降のラベルが避けられるよう、描画した矩形を記録
       placedRects.push(rect);
     }
 
-    // 関節角度（左右の膝・肘）と肩／上体の傾きを計算し、画像上に重ねて表示する
-    function drawAngles(landmarks, width, height) {
+    // 関節角度（左右の膝・肘）と肩／上体の傾きを計算し、対象Canvasに重ねて表示する
+    function drawAngles(targetCtx, landmarks, width, height) {
       // 必要なランドマークを取り出す
       const lShoulder = landmarks[LM.LEFT_SHOULDER];
       const rShoulder = landmarks[LM.RIGHT_SHOULDER];
@@ -514,28 +608,28 @@
       if (isVisible(lHip) && isVisible(lKnee) && isVisible(lAnkle)) {
         const a = calcAngle3(lHip, lKnee, lAnkle);
         if (a !== null) {
-          drawAngleLabel(`左膝 ${Math.round(a)}°`, lKnee.x * width, lKnee.y * height, width, placedRects);
+          drawAngleLabel(targetCtx, `左膝 ${Math.round(a)}°`, lKnee.x * width, lKnee.y * height, width, placedRects);
         }
       }
       // 右膝の角度（股関節-膝-足首）
       if (isVisible(rHip) && isVisible(rKnee) && isVisible(rAnkle)) {
         const a = calcAngle3(rHip, rKnee, rAnkle);
         if (a !== null) {
-          drawAngleLabel(`右膝 ${Math.round(a)}°`, rKnee.x * width, rKnee.y * height, width, placedRects);
+          drawAngleLabel(targetCtx, `右膝 ${Math.round(a)}°`, rKnee.x * width, rKnee.y * height, width, placedRects);
         }
       }
       // 左肘の角度（肩-肘-手首）
       if (isVisible(lShoulder) && isVisible(lElbow) && isVisible(lWrist)) {
         const a = calcAngle3(lShoulder, lElbow, lWrist);
         if (a !== null) {
-          drawAngleLabel(`左肘 ${Math.round(a)}°`, lElbow.x * width, lElbow.y * height, width, placedRects);
+          drawAngleLabel(targetCtx, `左肘 ${Math.round(a)}°`, lElbow.x * width, lElbow.y * height, width, placedRects);
         }
       }
       // 右肘の角度（肩-肘-手首）
       if (isVisible(rShoulder) && isVisible(rElbow) && isVisible(rWrist)) {
         const a = calcAngle3(rShoulder, rElbow, rWrist);
         if (a !== null) {
-          drawAngleLabel(`右肘 ${Math.round(a)}°`, rElbow.x * width, rElbow.y * height, width, placedRects);
+          drawAngleLabel(targetCtx, `右肘 ${Math.round(a)}°`, rElbow.x * width, rElbow.y * height, width, placedRects);
         }
       }
       // 肩の傾き（左右の肩を結ぶ線が水平から何度傾いているか）
@@ -545,7 +639,7 @@
         if (tilt !== null) {
           const mx = ((lShoulder.x + rShoulder.x) / 2) * width;
           const my = ((lShoulder.y + rShoulder.y) / 2) * height;
-          drawAngleLabel(`肩の傾き ${Math.round(tilt)}°`, mx, my, width, placedRects);
+          drawAngleLabel(targetCtx, `肩の傾き ${Math.round(tilt)}°`, mx, my, width, placedRects);
         }
       }
       // 上体の傾き（股関節中点→肩中点のベクトルが垂直から何度傾いているか）
@@ -563,7 +657,7 @@
         if (tilt !== null) {
           const mx = ((shoulderMid.x + hipMid.x) / 2) * width;
           const my = ((shoulderMid.y + hipMid.y) / 2) * height;
-          drawAngleLabel(`上体の傾き ${Math.round(tilt)}°`, mx, my, width, placedRects);
+          drawAngleLabel(targetCtx, `上体の傾き ${Math.round(tilt)}°`, mx, my, width, placedRects);
         }
       }
     }
@@ -580,7 +674,7 @@
         const landmarks = result.landmarks[0];
         drawSkeleton(ctx, landmarks, canvas.width, canvas.height);
         // スケルトンの上に関節角度・体幹傾きの数値を重ねる
-        drawAngles(landmarks, canvas.width, canvas.height);
+        drawAngles(ctx, landmarks, canvas.width, canvas.height);
         setStatus("検出成功：1人分の姿勢と関節角度を表示しています。");
       } else {
         setStatus("人物の姿勢を検出できませんでした。別の画像をお試しください。", true);
@@ -625,9 +719,174 @@
 
     // === 動画分析 ===
 
+    // 1次元値の時間方向平滑化（One Euro Filter, https://gery.casiez.net/1euro/）。
+    // 動きが遅いときは滑らかに、動きが速いときは追従するよう
+    // カットオフ周波数を信号の変化速度に応じて動的に変える。
+    class OneEuroFilter {
+      constructor(minCutoff, beta, dCutoff) {
+        this.minCutoff = minCutoff;
+        this.beta = beta;
+        this.dCutoff = dCutoff;
+        this.reset();
+      }
+      // 初期化／リセット。動画切替・シーク・非表示→再表示で呼ぶ。
+      reset() {
+        this.xPrev = null;
+        this.dxPrev = 0;
+        this.tPrev = null;
+      }
+      // 1次ローパスの平滑化係数：カットオフ周波数 cutoff(Hz) と
+      // サンプル間隔 dt(秒) から計算する
+      static smoothingFactor(cutoff, dt) {
+        const r = 2 * Math.PI * cutoff * dt;
+        return r / (r + 1);
+      }
+      // 値 x をタイムスタンプ t(ms) で更新し、平滑化後の値を返す
+      filter(x, t) {
+        if (this.tPrev === null) {
+          // 初回サンプル：平滑化せずそのまま返し、状態を初期化
+          this.tPrev = t;
+          this.xPrev = x;
+          this.dxPrev = 0;
+          return x;
+        }
+        // ミリ秒→秒に変換。0除算回避のため下限を入れる
+        const dt = Math.max((t - this.tPrev) / 1000, 1e-6);
+        const dx = (x - this.xPrev) / dt;
+        // 速度成分自体も低域通過（高周波ノイズを除いた“真の速度”を推定）
+        const aD = OneEuroFilter.smoothingFactor(this.dCutoff, dt);
+        const dxHat = aD * dx + (1 - aD) * this.dxPrev;
+        // 速度が大きいほどカットオフを上げてラグを減らす
+        const cutoff = this.minCutoff + this.beta * Math.abs(dxHat);
+        const a = OneEuroFilter.smoothingFactor(cutoff, dt);
+        const xHat = a * x + (1 - a) * this.xPrev;
+        this.xPrev = xHat;
+        this.dxPrev = dxHat;
+        this.tPrev = t;
+        return xHat;
+      }
+    }
+
+    // MediaPipe Pose のランドマーク数（33点）
+    const POSE_LANDMARK_COUNT = 33;
+    // 各ランドマークの x, y 用のフィルタを個別に保持する
+    const landmarkFiltersX = [];
+    const landmarkFiltersY = [];
+    for (let i = 0; i < POSE_LANDMARK_COUNT; i++) {
+      landmarkFiltersX.push(new OneEuroFilter(ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA, ONE_EURO_D_CUTOFF));
+      landmarkFiltersY.push(new OneEuroFilter(ONE_EURO_MIN_CUTOFF, ONE_EURO_BETA, ONE_EURO_D_CUTOFF));
+    }
+
+    // すべてのランドマーク平滑化フィルタをリセットする。
+    // 動画ファイル切替・シーク時に呼ぶ（前の位置情報を引きずらないため）。
+    function resetVideoFilters() {
+      for (const f of landmarkFiltersX) f.reset();
+      for (const f of landmarkFiltersY) f.reset();
+    }
+
+    // 1フレーム分のランドマーク配列に時間方向のスムージングを適用する。
+    // - visibility がしきい値未満のランドマークはフィルタをリセットし、
+    //   visibility=0 とした未平滑コピーを返す（再表示時に過去座標から引っ張られない）。
+    // - しきい値以上なら x, y を One Euro Filter に通す（z, visibility は素通し）。
+    // t は performance.now() のミリ秒値。
+    function smoothLandmarks(landmarks, t) {
+      const smoothed = new Array(landmarks.length);
+      for (let i = 0; i < landmarks.length; i++) {
+        const p = landmarks[i];
+        if (!p) { smoothed[i] = p; continue; }
+        const vis = typeof p.visibility === "number" ? p.visibility : 1;
+        if (vis < VIDEO_VISIBILITY_THRESHOLD || i >= POSE_LANDMARK_COUNT) {
+          // 非表示扱い：フィルタ状態をリセットし、visibilityを0にして
+          // 描画・角度計算の両方から除外させる
+          if (i < POSE_LANDMARK_COUNT) {
+            landmarkFiltersX[i].reset();
+            landmarkFiltersY[i].reset();
+          }
+          smoothed[i] = { x: p.x, y: p.y, z: p.z, visibility: 0 };
+          continue;
+        }
+        const sx = landmarkFiltersX[i].filter(p.x, t);
+        const sy = landmarkFiltersY[i].filter(p.y, t);
+        smoothed[i] = { x: sx, y: sy, z: p.z, visibility: p.visibility };
+      }
+      return smoothed;
+    }
+
     let rafId = null;            // requestAnimationFrameのID（停止用）
     let lastVideoTime = -1;      // 最後に検出した動画時刻（同じフレームの再検出を防ぐ）
     let currentVideoUrl = null;  // 現在再生中のオブジェクトURL（差し替え時に解放）
+    let currentPlaybackRate = 1; // ユーザーが選んだ再生速度（ファイル切替後も維持）
+
+    // 動画1コマあたりの秒数。コマ送りボタンの移動量に使う。
+    // 標準HTMLでは正確なフレームレートを取れないブラウザもあるため、
+    // 既定は約1/30秒。requestVideoFrameCallback が使える環境では
+    // 再生中に実測値で上書きする（下記 onVideoFrameCallback）。
+    let videoFrameDuration = 1 / 30;
+    let lastFrameMediaTime = null;
+
+    // requestVideoFrameCallback（rVFC）対応ブラウザで、実フレーム間隔を観測して
+    // videoFrameDuration を更新する。未対応ブラウザでは何もしない。
+    function onVideoFrameCallback(_now, metadata) {
+      if (lastFrameMediaTime !== null) {
+        const dt = metadata.mediaTime - lastFrameMediaTime;
+        // 異常値（一時停止やシークでの跳び）は採用しない：5fps〜200fps相当
+        if (dt > 0.005 && dt < 0.2) {
+          videoFrameDuration = dt;
+        }
+      }
+      lastFrameMediaTime = metadata.mediaTime;
+      // 継続観測のため再登録
+      if (typeof video.requestVideoFrameCallback === "function") {
+        video.requestVideoFrameCallback(onVideoFrameCallback);
+      }
+    }
+    if (typeof video.requestVideoFrameCallback === "function") {
+      video.requestVideoFrameCallback(onVideoFrameCallback);
+    }
+
+    // visibility がしきい値未満のランドマークを描画・角度計算から除外するため
+    // visibility=0 に揃えたコピーを返す（位置 x,y は素のまま、平滑化は通さない）。
+    // 一時停止中・コマ送り中など「そのコマの生の検出結果を使う」場面で使う。
+    function applyVisibilityFilterOnly(landmarks) {
+      return landmarks.map((p) => {
+        if (!p) return p;
+        const vis = typeof p.visibility === "number" ? p.visibility : 1;
+        if (vis < VIDEO_VISIBILITY_THRESHOLD) {
+          return { x: p.x, y: p.y, z: p.z, visibility: 0 };
+        }
+        return p;
+      });
+    }
+
+    // 現在の動画フレームに対して姿勢検出を行い、スケルトンと角度を描画する。
+    // useSmoothing=true なら時間方向のスムージングを適用（再生中）。
+    // false なら生の検出結果をそのまま使う（一時停止中・コマ送り中）。
+    function runDetectionAndDraw(useSmoothing) {
+      if (!poseLandmarkerVideo) return;
+      try {
+        // detectForVideo は単調増加するタイムスタンプ(ms)を要求するので
+        // performance.now() を渡す
+        const now = performance.now();
+        const result = poseLandmarkerVideo.detectForVideo(video, now);
+        // オーバーレイをクリアして再描画
+        videoCtx.clearRect(0, 0, videoCanvas.width, videoCanvas.height);
+        if (result && result.landmarks && result.landmarks.length > 0) {
+          const lm = useSmoothing
+            ? smoothLandmarks(result.landmarks[0], now)
+            : applyVisibilityFilterOnly(result.landmarks[0]);
+          drawSkeleton(
+            videoCtx,
+            lm,
+            videoCanvas.width,
+            videoCanvas.height,
+            VIDEO_VISIBILITY_THRESHOLD
+          );
+          drawAngles(videoCtx, lm, videoCanvas.width, videoCanvas.height);
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    }
 
     // 動画の1フレームごとに呼ばれる：姿勢検出してスケルトンを重ねる
     function videoFrame() {
@@ -637,22 +896,24 @@
         return;
       }
       // 動画の現在時刻が前回と変わっていれば検出を走らせる
+      // （rAFは表示レートで回るが検出はフレーム更新時のみで十分）
       if (video.currentTime !== lastVideoTime) {
         lastVideoTime = video.currentTime;
-        try {
-          // detectForVideo は単調増加するタイムスタンプ(ms)を要求するので
-          // performance.now() を渡す
-          const result = poseLandmarkerVideo.detectForVideo(video, performance.now());
-          // オーバーレイをクリアしてスケルトンを描画
-          videoCtx.clearRect(0, 0, videoCanvas.width, videoCanvas.height);
-          if (result && result.landmarks && result.landmarks.length > 0) {
-            drawSkeleton(videoCtx, result.landmarks[0], videoCanvas.width, videoCanvas.height);
-          }
-        } catch (err) {
-          console.error(err);
-        }
+        // 再生中はスムージングを適用してブレを抑える
+        runDetectionAndDraw(true);
       }
       rafId = requestAnimationFrame(videoFrame);
+    }
+
+    // 1コマ進む／戻る：一時停止中に呼ばれ、currentTimeを移動する。
+    // 実際の検出と描画はその後の "seeked" イベントハンドラ内で行う。
+    function stepFrame(direction) {
+      if (!poseLandmarkerVideo) return;
+      if (!isFinite(video.duration)) return;
+      if (!video.paused) return; // 念のため再生中はスキップ（UI上もボタンは無効）
+      const delta = direction * videoFrameDuration;
+      const newTime = Math.max(0, Math.min(video.duration, video.currentTime + delta));
+      video.currentTime = newTime;
     }
 
     // 動画ファイル選択時：オブジェクトURLを差し替えて video に読み込む
@@ -668,20 +929,40 @@
       currentVideoUrl = URL.createObjectURL(file);
       video.src = currentVideoUrl;
       video.load();
-      // オーバーレイをクリア、再生位置追跡もリセット
+      // オーバーレイをクリア、再生位置追跡・スムージング状態・フレーム間隔観測もリセット
       videoCtx.clearRect(0, 0, videoCanvas.width, videoCanvas.height);
       lastVideoTime = -1;
+      lastFrameMediaTime = null;
+      resetVideoFilters();
       setVideoStatus("動画を読み込み中…");
       // 同じファイル再選択を可能にする
       videoFileInput.value = "";
+    });
+
+    // シークで再生位置が飛んだ場合は、平滑化フィルタをリセットして
+    // 直前の位置から滑らかに引っ張られないようにする。
+    // 一時停止中（コマ送り含む）なら、そのコマに対して検出と描画をすぐに実行する。
+    video.addEventListener("seeked", () => {
+      resetVideoFilters();
+      lastVideoTime = -1; // 再生中なら次のrAFで必ず再検出
+      if (video.paused && poseLandmarkerVideo) {
+        // コマ送り・任意シーク後：そのコマの結果を生で描画
+        runDetectionAndDraw(false);
+        lastVideoTime = video.currentTime; // 同じ時刻での重複検出を防ぐ
+      }
     });
 
     // 動画のメタ情報（解像度など）が読めたタイミングで Canvas サイズを揃える
     video.addEventListener("loadedmetadata", () => {
       videoCanvas.width = video.videoWidth;
       videoCanvas.height = video.videoHeight;
+      // src差し替えで playbackRate は1.0にリセットされるため、選択中の速度を再適用
+      video.playbackRate = currentPlaybackRate;
       playPauseBtn.disabled = false;
-      setVideoStatus("読み込み完了：再生ボタンで解析を開始します。");
+      // 読み込み直後は一時停止状態。コマ送りボタンも有効化する
+      stepBackBtn.disabled = false;
+      stepForwardBtn.disabled = false;
+      setVideoStatus("読み込み完了：再生・コマ送り・速度変更が使えます。");
     });
 
     // 再生・一時停止ボタン
@@ -697,23 +978,46 @@
       }
     });
 
-    // 再生開始時：ボタン表示を「一時停止」にして検出ループを開始
+    // コマ送り（前へ／次へ）。一時停止中のみ有効
+    stepBackBtn.addEventListener("click", () => stepFrame(-1));
+    stepForwardBtn.addEventListener("click", () => stepFrame(+1));
+
+    // 再生速度の切替。video.playbackRate を変えるだけで video が遅く再生される
+    speedButtons.forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const rate = parseFloat(btn.dataset.rate);
+        if (!isFinite(rate) || rate <= 0) return;
+        currentPlaybackRate = rate;
+        video.playbackRate = rate;
+        // セグメントボタンのアクティブ状態を更新
+        speedButtons.forEach((b) => b.classList.toggle("active", b === btn));
+      });
+    });
+
+    // 再生開始時：ボタン表示を「一時停止」にして検出ループを開始。
+    // 再生中はコマ送りボタンを無効化（誤操作で意図せずシークしないため）。
     video.addEventListener("play", () => {
       playPauseBtn.textContent = "一時停止";
       setVideoStatus("解析中…");
+      stepBackBtn.disabled = true;
+      stepForwardBtn.disabled = true;
       if (rafId === null) {
         rafId = requestAnimationFrame(videoFrame);
       }
     });
 
-    // 一時停止／終了時：ボタン表示を戻す（ループは videoFrame 内で自然停止）
+    // 一時停止／終了時：ボタン表示を戻し、コマ送りを有効化（ループは videoFrame 内で自然停止）
     video.addEventListener("pause", () => {
       playPauseBtn.textContent = "再生";
-      setVideoStatus("一時停止中。再生で解析を再開します。");
+      setVideoStatus("一時停止中。コマ送りで1コマずつ確認できます。");
+      stepBackBtn.disabled = false;
+      stepForwardBtn.disabled = false;
     });
     video.addEventListener("ended", () => {
       playPauseBtn.textContent = "再生";
       setVideoStatus("再生が終了しました。");
+      stepBackBtn.disabled = false;
+      stepForwardBtn.disabled = false;
     });
 
     // エラー時の表示
