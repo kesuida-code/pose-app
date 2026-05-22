@@ -353,6 +353,24 @@
       border-radius: 6px;
     }
     .reference-saved-info[hidden] { display: none; }
+    /* 「写真から検出」の書き出し用エリア：コメント入力＋書き出しボタン */
+    .export-row {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .export-comment-input {
+      width: 100%;
+      padding: 12px 14px;
+      background: #222;
+      color: #fff;
+      border: 1px solid #333;
+      border-radius: 8px;
+      font-size: 15px;
+      -webkit-appearance: none;
+    }
+    .export-comment-input::placeholder { color: #777; }
+    .export-comment-input:disabled { opacity: 0.5; }
     /* 動画分析 ↔ お手本 の比較表示。動画を一時停止中かつお手本が登録されている時のみ表示 */
     .comparison-wrap {
       display: flex;
@@ -418,6 +436,14 @@
       <div class="canvas-wrap">
         <!-- 画像 + スケルトンを重ねて描画するキャンバス -->
         <canvas id="canvas" width="1" height="1"></canvas>
+      </div>
+
+      <!-- 解析画像にひとことコメントを付けて書き出すエリア。
+           姿勢検出に成功したときだけ入力欄とボタンが有効化される。 -->
+      <div class="export-row">
+        <input id="exportCommentInput" class="export-comment-input" type="text"
+               placeholder="例：右肩がもう少し下、上体は正面のまま" disabled />
+        <button id="exportImageBtn" class="action-btn" disabled>画像を書き出す</button>
       </div>
     </section>
 
@@ -522,6 +548,8 @@
     const statusEl = document.getElementById("status");
     const canvas = document.getElementById("canvas");
     const ctx = canvas.getContext("2d");
+    const exportCommentInput = document.getElementById("exportCommentInput");
+    const exportImageBtn = document.getElementById("exportImageBtn");
 
     // DOM要素の取得（お手本画像用）
     const referenceFileInput = document.getElementById("referenceFileInput");
@@ -996,10 +1024,154 @@
         // スケルトンの上に関節角度・体幹傾きの数値を重ねる
         drawAngles(ctx, landmarks, canvas.width, canvas.height);
         setStatus("検出成功：1人分の姿勢と関節角度を表示しています。");
+        // 解析成功時のみ書き出し関連UIを有効化
+        setExportControlsEnabled(true);
       } else {
         setStatus("人物の姿勢を検出できませんでした。別の画像をお試しください。", true);
+        setExportControlsEnabled(false);
       }
     }
+
+    // === 「写真から検出」の書き出し機能 ===
+
+    // コメント入力と書き出しボタンの有効／無効を一括で切り替えるヘルパー
+    function setExportControlsEnabled(enabled) {
+      exportCommentInput.disabled = !enabled;
+      exportImageBtn.disabled = !enabled;
+    }
+
+    // 日本語前提：スペース無しの文字列を「1文字ずつ」最大幅で折り返して行配列にする
+    function wrapJapaneseText(measureCtx, text, maxWidth) {
+      const lines = [];
+      let current = "";
+      // for...of は Unicode コードポイント単位（絵文字・サロゲートペアも安全）
+      for (const ch of text) {
+        const test = current + ch;
+        if (measureCtx.measureText(test).width > maxWidth && current) {
+          lines.push(current);
+          current = ch;
+        } else {
+          current = test;
+        }
+      }
+      if (current) lines.push(current);
+      return lines;
+    }
+
+    // ファイル名に使うタイムスタンプ（YYYYMMDD-HHMMSS）
+    function nowStampForFilename() {
+      const d = new Date();
+      const p = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+    }
+
+    // 解析済み canvas を変更せず、オフスクリーン canvas にコピー→
+    // コメントがあれば下に帯と文字を追加して、共有 or ダウンロードする
+    async function exportAnnotatedImage() {
+      // 解析済み画像が無い（width=1=未解析）なら何もしない
+      if (canvas.width <= 1 || canvas.height <= 1) {
+        setStatus("解析した画像がありません。", true);
+        return;
+      }
+      const text = (exportCommentInput.value || "").trim();
+      const w = canvas.width;
+      const h = canvas.height;
+
+      // サイズは画像幅に対する比率で決める（iPhone写真は数千pxになるため固定pxにしない）
+      const fontSize  = Math.max(20, Math.round(w * 0.035));
+      const paddingX  = Math.max(12, Math.round(w * 0.025));
+      const paddingY  = Math.max(10, Math.round(w * 0.018));
+      const lineHeight = Math.round(fontSize * 1.35);
+      const fontDecl = `bold ${fontSize}px -apple-system, "Hiragino Sans", sans-serif`;
+
+      // 折り返し計算：別キャンバスの 2D コンテキストで measureText を行う
+      const measure = document.createElement("canvas").getContext("2d");
+      measure.font = fontDecl;
+      const maxTextWidth = w - paddingX * 2;
+      const lines = text ? wrapJapaneseText(measure, text, maxTextWidth) : [];
+
+      // コメントが空なら帯は付けない
+      const bandHeight = lines.length > 0 ? paddingY * 2 + lineHeight * lines.length : 0;
+
+      // 書き出し用 canvas を新規作成（画面上のものは触らない）
+      const out = document.createElement("canvas");
+      out.width = w;
+      out.height = h + bandHeight;
+      const octx = out.getContext("2d");
+
+      // 解析済み画像をそのままコピー
+      octx.drawImage(canvas, 0, 0);
+
+      // 帯と文字を描画
+      if (bandHeight > 0) {
+        octx.fillStyle = "#111";
+        octx.fillRect(0, h, w, bandHeight);
+        octx.font = fontDecl;
+        octx.fillStyle = "#ffffff";
+        octx.textBaseline = "top";
+        octx.textAlign = "left";
+        for (let i = 0; i < lines.length; i++) {
+          octx.fillText(lines[i], paddingX, h + paddingY + i * lineHeight);
+        }
+      }
+
+      // JPEG Blob 化（品質0.9）
+      const blob = await new Promise((resolve) => out.toBlob(resolve, "image/jpeg", 0.9));
+      if (!blob) {
+        setStatus("画像の書き出しに失敗しました。", true);
+        return;
+      }
+
+      const filename = `pose-${nowStampForFilename()}.jpg`;
+      const file = new File([blob], filename, { type: "image/jpeg" });
+
+      // Web Share API（files対応）が使えれば共有シートを開く（iPhone Safari 等）
+      const canShareFiles = typeof navigator !== "undefined"
+        && typeof navigator.share === "function"
+        && typeof navigator.canShare === "function"
+        && navigator.canShare({ files: [file] });
+      if (canShareFiles) {
+        try {
+          await navigator.share({
+            files: [file],
+            title: "姿勢分析",
+            text: text || undefined
+          });
+          setStatus("共有シートを開きました。");
+          return;
+        } catch (err) {
+          // ユーザーキャンセルは正常終了扱い
+          if (err && err.name === "AbortError") {
+            setStatus("共有をキャンセルしました。");
+            return;
+          }
+          console.error(err);
+          // 失敗時は下のダウンロードへフォールバック
+        }
+      }
+
+      // フォールバック：通常ダウンロード（PC Chrome など）
+      try {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        // すぐ revoke すると一部ブラウザで取りこぼすので少し遅延
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        setStatus("画像をダウンロードしました。");
+      } catch (err) {
+        console.error(err);
+        setStatus("画像の保存に失敗しました：" + err.message, true);
+      }
+    }
+
+    // ボタンに書き出し処理を接続
+    exportImageBtn.addEventListener("click", () => { exportAnnotatedImage(); });
+
+    // === ここまで 書き出し機能 ===
 
     // === お手本画像（リファレンス姿勢） ===
 
@@ -1325,6 +1497,8 @@
         return;
       }
       setStatus("画像を読み込み中…");
+      // 解析が再度成功するまで書き出し関連UIは無効化
+      setExportControlsEnabled(false);
 
       try {
         // HEICなど直接デコードできない形式は事前に変換する
