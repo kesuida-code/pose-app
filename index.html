@@ -581,6 +581,11 @@
     // 画面外などで信頼度が落ちた関節のブレを抑えるための値。後で調整可。
     const VIDEO_VISIBILITY_THRESHOLD = 0.5;
 
+    // 動画の角度ラベルをお手本と比較するときの「差が大きい」のしきい値（度）。
+    // |生徒の角度 − お手本の角度| がこの値以上ならラベル文字を赤くする。
+    // 単位は度。後で調整しやすいよう定数化。
+    const DIFF_THRESHOLD = 15;
+
     // 動画ランドマークの時間方向スムージング（One Euro Filter）のパラメータ。後で調整可。
     //  - ONE_EURO_MIN_CUTOFF: 静止時の最低カットオフ周波数(Hz)。
     //      小さいほど滑らか（ブレ低減）、大きいほど追従。
@@ -813,7 +818,7 @@
     // 既に置かれた他のラベルと重ならないよう配置を自動調整し、
     // 関節点から離れた位置に置く場合は引き出し線でつなぐ。
     // placedRects は呼び出し側で配列を渡し、描画した矩形が追記される。
-    function drawAngleLabel(targetCtx, text, anchorX, anchorY, width, placedRects) {
+    function drawAngleLabel(targetCtx, text, anchorX, anchorY, width, placedRects, color = "#ffffff") {
       // スマホでも読めるよう、画像幅に対する比率でフォントサイズを決める（下限あり）
       const fontSize = Math.max(16, Math.round(width * 0.028));
       targetCtx.font = `bold ${fontSize}px -apple-system, "Hiragino Sans", sans-serif`;
@@ -849,10 +854,10 @@
       targetCtx.fillStyle = "rgba(0, 0, 0, 0.65)";
       targetCtx.fillRect(rect.x, rect.y, rect.w, rect.h);
 
-      // 文字（白＋黒縁取り）
+      // 文字（指定色＋黒縁取り）。color の既定は白、比較時に赤などへ差し替えられる。
       targetCtx.lineWidth = Math.max(2, Math.round(fontSize * 0.12));
       targetCtx.strokeStyle = "rgba(0, 0, 0, 0.9)";
-      targetCtx.fillStyle = "#ffffff";
+      targetCtx.fillStyle = color;
       const tx = rect.x + paddingX;
       const ty = rect.y + paddingY + fontSize / 2;
       targetCtx.strokeText(text, tx, ty);
@@ -862,8 +867,11 @@
       placedRects.push(rect);
     }
 
-    // 関節角度（左右の膝・肘）と肩／上体の傾きを計算し、対象Canvasに重ねて表示する
-    function drawAngles(targetCtx, landmarks, width, height) {
+    // 関節角度（左右の膝・肘）と肩／上体の傾きを計算し、対象Canvasに重ねて表示する。
+    // compareToReference=true のときだけ、お手本(referenceAngles)との差を見て
+    // 差が DIFF_THRESHOLD 以上の項目は赤い文字色でラベルを描画する。
+    // 既定値 false（静止画分析・お手本画像の描画は今まで通り白文字のまま）。
+    function drawAngles(targetCtx, landmarks, width, height, compareToReference = false) {
       // 必要なランドマークを取り出す
       const lShoulder = landmarks[LM.LEFT_SHOULDER];
       const rShoulder = landmarks[LM.RIGHT_SHOULDER];
@@ -881,32 +889,46 @@
       // 配置済みラベルの矩形リスト（重なり回避のため drawAngleLabel に共有）
       const placedRects = [];
 
+      // 比較モード時に、生徒値とお手本値の差の絶対値で文字色を決めるヘルパー。
+      // 比較OFF、またはお手本値が無い項目は白のまま。
+      function pickColor(studentValue, refKey) {
+        if (!compareToReference) return "#ffffff";
+        const refValue = referenceAngles[refKey];
+        if (refValue === null || refValue === undefined) return "#ffffff";
+        if (Math.abs(studentValue - refValue) >= DIFF_THRESHOLD) return "#ff5b5b";
+        return "#ffffff";
+      }
+
       // 左膝の角度（股関節-膝-足首）
       if (isVisible(lHip) && isVisible(lKnee) && isVisible(lAnkle)) {
         const a = calcAngle3(lHip, lKnee, lAnkle);
         if (a !== null) {
-          drawAngleLabel(targetCtx, `左膝 ${Math.round(a)}°`, lKnee.x * width, lKnee.y * height, width, placedRects);
+          const color = pickColor(a, "leftKnee");
+          drawAngleLabel(targetCtx, `左膝 ${Math.round(a)}°`, lKnee.x * width, lKnee.y * height, width, placedRects, color);
         }
       }
       // 右膝の角度（股関節-膝-足首）
       if (isVisible(rHip) && isVisible(rKnee) && isVisible(rAnkle)) {
         const a = calcAngle3(rHip, rKnee, rAnkle);
         if (a !== null) {
-          drawAngleLabel(targetCtx, `右膝 ${Math.round(a)}°`, rKnee.x * width, rKnee.y * height, width, placedRects);
+          const color = pickColor(a, "rightKnee");
+          drawAngleLabel(targetCtx, `右膝 ${Math.round(a)}°`, rKnee.x * width, rKnee.y * height, width, placedRects, color);
         }
       }
       // 左肘の角度（肩-肘-手首）
       if (isVisible(lShoulder) && isVisible(lElbow) && isVisible(lWrist)) {
         const a = calcAngle3(lShoulder, lElbow, lWrist);
         if (a !== null) {
-          drawAngleLabel(targetCtx, `左肘 ${Math.round(a)}°`, lElbow.x * width, lElbow.y * height, width, placedRects);
+          const color = pickColor(a, "leftElbow");
+          drawAngleLabel(targetCtx, `左肘 ${Math.round(a)}°`, lElbow.x * width, lElbow.y * height, width, placedRects, color);
         }
       }
       // 右肘の角度（肩-肘-手首）
       if (isVisible(rShoulder) && isVisible(rElbow) && isVisible(rWrist)) {
         const a = calcAngle3(rShoulder, rElbow, rWrist);
         if (a !== null) {
-          drawAngleLabel(targetCtx, `右肘 ${Math.round(a)}°`, rElbow.x * width, rElbow.y * height, width, placedRects);
+          const color = pickColor(a, "rightElbow");
+          drawAngleLabel(targetCtx, `右肘 ${Math.round(a)}°`, rElbow.x * width, rElbow.y * height, width, placedRects, color);
         }
       }
       // 肩の傾き（左右の肩を結ぶ線が水平から何度傾いているか）
@@ -916,7 +938,8 @@
         if (tilt !== null) {
           const mx = ((lShoulder.x + rShoulder.x) / 2) * width;
           const my = ((lShoulder.y + rShoulder.y) / 2) * height;
-          drawAngleLabel(targetCtx, `肩の傾き ${Math.round(tilt)}°`, mx, my, width, placedRects);
+          const color = pickColor(tilt, "shoulderTilt");
+          drawAngleLabel(targetCtx, `肩の傾き ${Math.round(tilt)}°`, mx, my, width, placedRects, color);
         }
       }
       // 上体の傾き（股関節中点→肩中点のベクトルが垂直から何度傾いているか）
@@ -934,7 +957,8 @@
         if (tilt !== null) {
           const mx = ((shoulderMid.x + hipMid.x) / 2) * width;
           const my = ((shoulderMid.y + hipMid.y) / 2) * height;
-          drawAngleLabel(targetCtx, `上体の傾き ${Math.round(tilt)}°`, mx, my, width, placedRects);
+          const color = pickColor(tilt, "bodyTilt");
+          drawAngleLabel(targetCtx, `上体の傾き ${Math.round(tilt)}°`, mx, my, width, placedRects, color);
         }
       }
     }
@@ -1397,7 +1421,8 @@
           );
         }
         if (showAngles) {
-          drawAngles(videoCtx, lastDrawData.lm, videoCanvas.width, videoCanvas.height);
+          // 動画側だけお手本との比較で色付けする（true）
+          drawAngles(videoCtx, lastDrawData.lm, videoCanvas.width, videoCanvas.height, true);
         }
       }
       // 基準線はスケルトン・角度の上に乗せる
