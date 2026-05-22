@@ -344,6 +344,15 @@
       font-weight: bold;
       font-variant-numeric: tabular-nums;
     }
+    /* お手本がlocalStorageに保存されていることを示す小さなバッジ */
+    .reference-saved-info {
+      font-size: 12px;
+      color: #8ab8ff;
+      padding: 6px 10px;
+      background: rgba(42, 127, 255, 0.12);
+      border-radius: 6px;
+    }
+    .reference-saved-info[hidden] { display: none; }
     /* 動画分析 ↔ お手本 の比較表示。動画を一時停止中かつお手本が登録されている時のみ表示 */
     .comparison-wrap {
       display: flex;
@@ -420,6 +429,8 @@
         <label class="file-label" for="referenceFileInput">お手本画像を選択</label>
         <input class="file-input" id="referenceFileInput" type="file" accept="image/*,.heic,.heif" />
         <div class="status" id="referenceStatus">お手本画像を選ぶと、姿勢推定と角度計算を行います。</div>
+        <!-- お手本がlocalStorageに保存されている時の表示。再読込後の復元時にも出る -->
+        <div id="referenceSavedInfo" class="reference-saved-info" hidden></div>
         <!-- 角度一覧（初期は非表示。お手本画像が読み込まれてから表示） -->
         <div class="angle-list" id="referenceAngleList" hidden></div>
       </div>
@@ -518,10 +529,14 @@
     const referenceCanvas = document.getElementById("referenceCanvas");
     const referenceCtx = referenceCanvas.getContext("2d");
     const referenceAngleList = document.getElementById("referenceAngleList");
+    const referenceSavedInfo = document.getElementById("referenceSavedInfo");
 
     // DOM要素の取得（比較表示用）
     const comparisonWrap = document.getElementById("comparisonWrap");
     const comparisonList = document.getElementById("comparisonList");
+
+    // localStorage キー：お手本角度＋保存日時 を JSON 文字列で保存する
+    const REFERENCE_STORAGE_KEY = "pose-app-reference";
 
     // お手本画像から計算した角度をメモリ保存するグローバル。
     // 後で動画と比較するために参照する。値は度数（number）、
@@ -1070,6 +1085,71 @@
       ).join("");
     }
 
+    // 保存日時(ISO文字列) → "YYYY/MM/DD HH:MM" 形式の表示用文字列
+    function formatSavedDate(iso) {
+      const d = new Date(iso);
+      if (isNaN(d.getTime())) return "";
+      const y  = d.getFullYear();
+      const mo = String(d.getMonth() + 1).padStart(2, "0");
+      const da = String(d.getDate()).padStart(2, "0");
+      const h  = String(d.getHours()).padStart(2, "0");
+      const mi = String(d.getMinutes()).padStart(2, "0");
+      return `${y}/${mo}/${da} ${h}:${mi}`;
+    }
+
+    // 「お手本登録済み（保存日時: ...）」のバッジを更新／非表示にする
+    function updateReferenceSavedInfo(isoOrNull) {
+      if (!isoOrNull) {
+        referenceSavedInfo.hidden = true;
+        referenceSavedInfo.textContent = "";
+        return;
+      }
+      const dateStr = formatSavedDate(isoOrNull);
+      referenceSavedInfo.textContent = dateStr
+        ? `お手本登録済み（保存日時: ${dateStr}）`
+        : "お手本登録済み";
+      referenceSavedInfo.hidden = false;
+    }
+
+    // 現在の referenceAngles を localStorage に保存する（保存日時付き）
+    function saveReferenceToStorage() {
+      try {
+        const payload = {
+          angles: referenceAngles,
+          savedAt: new Date().toISOString()
+        };
+        localStorage.setItem(REFERENCE_STORAGE_KEY, JSON.stringify(payload));
+        updateReferenceSavedInfo(payload.savedAt);
+      } catch (err) {
+        // クォータ超過などは記録だけしてアプリは継続
+        console.error("お手本データの保存に失敗:", err);
+      }
+    }
+
+    // localStorage からお手本データを取り出す。なければ null
+    function loadReferenceFromStorage() {
+      try {
+        const raw = localStorage.getItem(REFERENCE_STORAGE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object") return null;
+        return parsed;
+      } catch (err) {
+        console.error("お手本データの読み込みに失敗:", err);
+        return null;
+      }
+    }
+
+    // 保存済みお手本データを破棄する（再登録に失敗したときに整合性を保つため）
+    function clearReferenceFromStorage() {
+      try {
+        localStorage.removeItem(REFERENCE_STORAGE_KEY);
+      } catch (err) {
+        console.error("お手本データの削除に失敗:", err);
+      }
+      updateReferenceSavedInfo(null);
+    }
+
     // お手本画像とスケルトン・角度をキャンバスに描画する。
     // 既存の drawSkeleton / drawAngles をそのまま再利用する。
     function renderReferenceImageWithPose(image, result) {
@@ -1080,13 +1160,14 @@
         const landmarks = result.landmarks[0];
         drawSkeleton(referenceCtx, landmarks, referenceCanvas.width, referenceCanvas.height);
         drawAngles(referenceCtx, landmarks, referenceCanvas.width, referenceCanvas.height);
-        // 角度を計算してメモリ保存 → 一覧表示も更新
+        // 角度を計算してメモリ保存 → 一覧表示も更新 → localStorage にも保存（再読込で復元できる）
         referenceAngles = computeAnglesFromLandmarks(landmarks);
         renderReferenceAngleList();
         referenceAngleList.hidden = false;
+        saveReferenceToStorage();
         setReferenceStatus("お手本の姿勢と角度を保存しました。");
       } else {
-        // 検出失敗時は値をクリア
+        // 検出失敗時は値をクリア（in-memory と storage の状態を一致させる）
         referenceAngles = {
           leftKnee: null, rightKnee: null,
           leftElbow: null, rightElbow: null,
@@ -1094,6 +1175,7 @@
         };
         renderReferenceAngleList();
         referenceAngleList.hidden = false;
+        clearReferenceFromStorage();
         setReferenceStatus("人物の姿勢を検出できませんでした。別の画像をお試しください。", true);
       }
       // 動画が既に一時停止中ならお手本との比較表示も更新する（後からお手本を登録したケース）
@@ -1805,6 +1887,30 @@
 
     // ページ読み込み時にモデルの初期化を開始（画像用・動画用とも）
     initPoseLandmarkers();
+
+    // ページ読み込み時に、localStorage 保存済みのお手本角度があれば復元する。
+    // 画像そのものは保存しないため、お手本キャンバスには何も表示しないが、
+    // 比較表＋動画の角度ラベル色分けは数値だけで動作するので機能上は問題ない。
+    (function restoreReferenceOnStartup() {
+      const loaded = loadReferenceFromStorage();
+      if (!loaded || !loaded.angles || typeof loaded.angles !== "object") return;
+      const a = loaded.angles;
+      // 数値のみ受け入れる（古いスキーマや破損データへの防御）
+      referenceAngles = {
+        leftKnee:     typeof a.leftKnee     === "number" ? a.leftKnee     : null,
+        rightKnee:    typeof a.rightKnee    === "number" ? a.rightKnee    : null,
+        leftElbow:    typeof a.leftElbow    === "number" ? a.leftElbow    : null,
+        rightElbow:   typeof a.rightElbow   === "number" ? a.rightElbow   : null,
+        shoulderTilt: typeof a.shoulderTilt === "number" ? a.shoulderTilt : null,
+        bodyTilt:     typeof a.bodyTilt     === "number" ? a.bodyTilt     : null
+      };
+      renderReferenceAngleList();
+      referenceAngleList.hidden = false;
+      updateReferenceSavedInfo(loaded.savedAt);
+      setReferenceStatus("前回登録したお手本の角度を復元しました（画像は保存していません）。");
+      // 動画側がすでに一時停止中なら比較表示も即座に更新
+      updateComparisonDisplay();
+    })();
   </script>
 </body>
 </html>
