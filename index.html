@@ -402,7 +402,7 @@
       <div class="controls">
         <!-- ファイル選択用ラベル。inputはdisplay:noneで隠しているのでラベル全体がボタンになる -->
         <label class="file-label" for="fileInput">画像を選択</label>
-        <input class="file-input" id="fileInput" type="file" accept="image/*" />
+        <input class="file-input" id="fileInput" type="file" accept="image/*,.heic,.heif" />
         <div class="status" id="status">準備中：モデルを読み込んでいます…</div>
       </div>
 
@@ -418,7 +418,7 @@
       <div class="controls">
         <!-- お手本画像のアップロードボタン -->
         <label class="file-label" for="referenceFileInput">お手本画像を選択</label>
-        <input class="file-input" id="referenceFileInput" type="file" accept="image/*" />
+        <input class="file-input" id="referenceFileInput" type="file" accept="image/*,.heic,.heif" />
         <div class="status" id="referenceStatus">お手本画像を選ぶと、姿勢推定と角度計算を行います。</div>
         <!-- 角度一覧（初期は非表示。お手本画像が読み込まれてから表示） -->
         <div class="angle-list" id="referenceAngleList" hidden></div>
@@ -493,6 +493,10 @@
 
     <div class="hint">画像・動画はサーバーに送信されず、すべて端末内で処理されます。</div>
   </div>
+
+  <!-- iPhoneのHEIC画像をブラウザで扱うため、heic2any を CDN から読み込む。
+       type="module" を付けず、グローバル関数 heic2any として使う。 -->
+  <script src="https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js"></script>
 
   <!-- MediaPipe Tasks Vision はESMでCDNから読み込み、IMAGEモードでPoseLandmarkerを使う -->
   <script type="module">
@@ -1108,7 +1112,11 @@
       setReferenceStatus("お手本画像を読み込み中…");
       let url = null;
       try {
-        url = URL.createObjectURL(file);
+        // HEICなど直接デコードできない形式は事前に変換する
+        setReferenceStatus("画像を変換中…");
+        const usable = await prepareImageFile(file);
+
+        url = URL.createObjectURL(usable);
         const image = new Image();
         image.src = url;
         // iOS Safariでもデコード完了を待つ
@@ -1197,6 +1205,36 @@
     // === ここまで 比較表示 ===
 
     // ファイル選択時の処理
+    // HEIC（iPhoneの写真形式）はブラウザで直接デコードできないので、
+    // heic2any で JPEG Blob に変換してから返す。それ以外はそのまま file を返す。
+    // 静止画と お手本画像 の両方の input から共通で使う。
+    async function prepareImageFile(file) {
+      // iPhone由来のHEICは file.type が空になることがあるため、拡張子もチェックする
+      const type = (file.type || "").toLowerCase();
+      const name = (file.name || "").toLowerCase();
+      const isHeic =
+        type.includes("heic") || type.includes("heif") ||
+        name.endsWith(".heic") || name.endsWith(".heif");
+      if (!isHeic) return file;
+
+      // heic2any が読み込まれていない場合は明確なエラーで知らせる
+      if (typeof heic2any !== "function") {
+        throw new Error("HEIC変換ライブラリ(heic2any)が読み込まれていません。");
+      }
+      try {
+        const converted = await heic2any({
+          blob: file,
+          toType: "image/jpeg",
+          quality: 0.9
+        });
+        // heic2any は単一のBlob または Blob配列（複数ページHEICのとき）を返す
+        return Array.isArray(converted) ? converted[0] : converted;
+      } catch (err) {
+        console.error(err);
+        throw new Error("HEIC画像の変換に失敗しました。別の画像形式でお試しください。");
+      }
+    }
+
     fileInput.addEventListener("change", async (event) => {
       const file = event.target.files && event.target.files[0];
       if (!file) return;
@@ -1207,8 +1245,12 @@
       setStatus("画像を読み込み中…");
 
       try {
+        // HEICなど直接デコードできない形式は事前に変換する
+        setStatus("画像を変換中…");
+        const usable = await prepareImageFile(file);
+
         // 画像をオブジェクトURL経由でHTMLImageElementとして読み込む
-        const url = URL.createObjectURL(file);
+        const url = URL.createObjectURL(usable);
         const image = new Image();
         // iOS Safariでもデコード完了を待つためにdecode()を使う
         image.src = url;
