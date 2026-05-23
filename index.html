@@ -633,6 +633,13 @@
     // 単位は度。後で調整しやすいよう定数化。
     const DIFF_THRESHOLD = 15;
 
+    // 書き出し画像のコメント帯に常に入れる固定の署名。
+    // 文言を変えるときはここを直す。配列の各要素が帯内の1行に対応する。
+    const EXPORT_SIGNATURE_LINES = [
+      "小野大輔・中村佳菜",
+      "ご予約：LINE ID ＠ここにLINE_IDを入れる"
+    ];
+
     // 動画ランドマークの時間方向スムージング（One Euro Filter）のパラメータ。後で調整可。
     //  - ONE_EURO_MIN_CUTOFF: 静止時の最低カットオフ周波数(Hz)。
     //      小さいほど滑らか（ブレ低減）、大きいほど追従。
@@ -1084,14 +1091,30 @@
       const lineHeight = Math.round(fontSize * 1.35);
       const fontDecl = `bold ${fontSize}px -apple-system, "Hiragino Sans", sans-serif`;
 
+      // 署名はコメントより一段控えめ：フォントを小さめに、bold を外す。
+      // LINE ID を読めるよう色は薄くしすぎず確実に判読できる明るさにする（下の描画で #cccccc）。
+      // サイズ・余白はコメント同様、画像幅に対する比率で決める。
+      const sigFontSize   = Math.max(14, Math.round(w * 0.024));
+      const sigLineHeight = Math.round(sigFontSize * 1.3);
+      const sigFontDecl   = `${sigFontSize}px -apple-system, "Hiragino Sans", sans-serif`;
+      // コメントと署名の間隔（コメントが空欄のときは間隔不要なので0にする）
+      const sigGap = Math.round(sigFontSize * 0.7);
+
       // 折り返し計算：別キャンバスの 2D コンテキストで measureText を行う
       const measure = document.createElement("canvas").getContext("2d");
       measure.font = fontDecl;
       const maxTextWidth = w - paddingX * 2;
       const lines = text ? wrapJapaneseText(measure, text, maxTextWidth) : [];
 
-      // コメントが空なら帯は付けない
-      const bandHeight = lines.length > 0 ? paddingY * 2 + lineHeight * lines.length : 0;
+      // 署名行は定数の改行をそのまま使う（折り返しはかけない）
+      const signatureLines = EXPORT_SIGNATURE_LINES;
+
+      // 署名は常に出すため、帯は常に表示する。
+      // 帯の高さ = 上下パディング + コメント部 + （コメントがあるときだけ）コメント↔署名の間隔 + 署名部
+      const commentBlockHeight = lines.length > 0 ? lineHeight * lines.length : 0;
+      const gap = lines.length > 0 ? sigGap : 0;
+      const signatureBlockHeight = sigLineHeight * signatureLines.length;
+      const bandHeight = paddingY * 2 + commentBlockHeight + gap + signatureBlockHeight;
 
       // 書き出し用 canvas を新規作成（画面上のものは触らない）
       const out = document.createElement("canvas");
@@ -1102,10 +1125,12 @@
       // 解析済み画像をそのままコピー
       octx.drawImage(canvas, 0, 0);
 
-      // 帯と文字を描画
-      if (bandHeight > 0) {
-        octx.fillStyle = "#111";
-        octx.fillRect(0, h, w, bandHeight);
+      // 帯を描画（常に出す）
+      octx.fillStyle = "#111";
+      octx.fillRect(0, h, w, bandHeight);
+
+      // コメント文（空欄なら描画スキップ。帯と署名だけ出る）
+      if (lines.length > 0) {
         octx.font = fontDecl;
         octx.fillStyle = "#ffffff";
         octx.textBaseline = "top";
@@ -1113,6 +1138,16 @@
         for (let i = 0; i < lines.length; i++) {
           octx.fillText(lines[i], paddingX, h + paddingY + i * lineHeight);
         }
+      }
+
+      // 署名（コメント文の下）。一段控えめだが LINE ID は確実に判読できる明るさにする。
+      octx.font = sigFontDecl;
+      octx.fillStyle = "#cccccc";
+      octx.textBaseline = "top";
+      octx.textAlign = "left";
+      const sigTopY = h + paddingY + commentBlockHeight + gap;
+      for (let i = 0; i < signatureLines.length; i++) {
+        octx.fillText(signatureLines[i], paddingX, sigTopY + i * sigLineHeight);
       }
 
       // JPEG Blob 化（品質0.9）
